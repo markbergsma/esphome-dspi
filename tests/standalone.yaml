@@ -1,0 +1,71 @@
+# Standalone compile guard.
+#
+# This config deliberately contains NO audio components: no speaker, no
+# i2s_audio, no media_player, no sendspin. If the dspi component ever grows a
+# dependency on any of them, this stops compiling.
+#
+# It also doubles as the minimal example of using the component on its own,
+# on a plain ESP32 with nothing else attached.
+
+esphome:
+  name: dspi-standalone
+  friendly_name: DSPi Standalone
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components: [dspi]
+
+logger:
+  # The DSPi link runs on its own UART; leave the default logger UART alone.
+  level: DEBUG
+
+uart:
+  - id: dspi_uart
+    tx_pin: GPIO17
+    rx_pin: GPIO16
+    baud_rate: 115200
+    data_bits: 8
+    parity: NONE
+    stop_bits: 1
+    rx_buffer_size: 512
+
+dspi:
+  id: dspi_hub
+  uart_id: dspi_uart
+
+number:
+  # What a listener turns. Same field as the USB host's volume slider, and the
+  # one that drives loudness compensation.
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: user_volume
+    name: Volume
+    id: dspi_volume
+
+  # The output ceiling: how loud this system may ever get. Categorised as
+  # configuration, so it stays out of the way of day-to-day control.
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: master_volume
+    name: Master Volume
+    id: dspi_master_volume
+
+switch:
+  - platform: dspi
+    dspi_id: dspi_hub
+    name: Mute
+    id: dspi_mute
+
+select:
+  - platform: dspi
+    dspi_id: dspi_hub
+    name: Input Source
+    id: dspi_input_source
+    entity_category: config

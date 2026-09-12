@@ -1,0 +1,102 @@
+# Control-only: a DSPi exposed to Home Assistant over UART, with no audio path.
+#
+# This is the component on its own -- no speaker, no Sendspin, no I2S. Useful
+# as a wall controller or rack panel, and as the bring-up step for DSPin: the
+# control link can be tested and finished before any I2S is wired.
+#
+# Shown on an ESP32-S3-BOX-3 because that is the initial DSPin target, but
+# nothing here is board-specific beyond the two pins in `substitutions` --
+# there is noPSRAM requirement and no audio, so this runs on any ESP32.
+#
+# BEFORE FLASHING: enable the DSPi's UART control interface once over USB:
+#     python3 tools/dspi_setup.py --apply
+# The DSPi refuses to configure that interface over the interface itself, so a
+# controller can never lock itself out.
+
+substitutions:
+  name: dspi-control
+  friendly_name: DSPi Control
+
+  # On an ESP32-S3-BOX-3 these are on the PCIe edge connector, reachable from
+  # either the DOCK (PMOD1 IO7 and IO5) or the BREAD adapter.
+  dspi_uart_tx: GPIO38 # -> DSPi GPIO 17 (its UART RX)
+  dspi_uart_rx: GPIO21 # <- DSPi GPIO 16 (its UART TX)
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32s3box
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+        
+    components: [dspi]
+
+logger:
+  level: DEBUG
+
+api:
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+uart:
+  - id: dspi_uart
+    tx_pin: ${dspi_uart_tx}
+    rx_pin: ${dspi_uart_rx}
+    baud_rate: 460800
+    data_bits: 8
+    parity: NONE
+    stop_bits: 1
+    rx_buffer_size: 512
+
+dspi:
+  id: dspi_hub
+  uart_id: dspi_uart
+  # No boot_input_source here: this device feeds the DSPi nothing, so it has no
+  # business claiming an input.
+  poll_interval: 0s
+
+number:
+  # What a listener turns. Same field as the USB host's volume slider, and the
+  # one that drives loudness compensation.
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: user_volume
+    name: Volume
+    id: dspi_volume
+
+  # The output ceiling: how loud this system may ever get. Categorised as
+  # configuration, so it stays out of the way of day-to-day control.
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: master_volume
+    name: Master Volume
+    id: dspi_master_volume
+
+switch:
+  - platform: dspi
+    dspi_id: dspi_hub
+    name: Mute
+    id: dspi_mute
+
+select:
+  - platform: dspi
+    dspi_id: dspi_hub
+    name: Input Source
+    id: dspi_input_source
+    entity_category: config

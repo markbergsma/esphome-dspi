@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  host-tests:
+    name: Framing tests and config validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ESPHome
+        run: pip install esphome
+
+      - name: Run host tests
+        run: ./tests/run.sh
+
+  compile:
+    name: Compile ${{ matrix.config }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # standalone.yaml has no audio components at all, so compiling it is
+        # what keeps the component usable on a device that is not a player.
+        config: [tests/standalone.yaml, examples/control-only.yaml]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ESPHome
+        run: pip install esphome
+
+      - name: Point the example at this checkout
+        run: |
+          mkdir -p examples
+          cat > examples/secrets.yaml <<'EOF'
+          wifi_ssid: "ci"
+          wifi_password: "ci-password"
+          EOF
+          # The example ships the github:// source users copy; compile it
+          # against this commit instead of whatever is published.
+          sed -i "s|source: github://markbergsma/esphome-dspi@main|source: {type: local, path: $PWD/components}|" \
+            examples/control-only.yaml
+
+      - name: Compile
+        run: esphome compile ${{ matrix.config }}
