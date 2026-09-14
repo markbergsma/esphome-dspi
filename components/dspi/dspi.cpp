@@ -78,6 +78,11 @@ void DSPiHub::loop() {
     request_refresh();
   }
 
+  // Spectrum polling, last of the producers so the debounced refresh above and
+  // any user command already queued keep precedence within this same pass.  It
+  // enqueues at most one transaction and never goes through request_refresh().
+  service_rta_(now);
+
   if (hub_state_ == HubState::IDLE) {
     send_next_();
   }
@@ -106,6 +111,27 @@ void DSPiHub::dump_config() {
   } else {
     ESP_LOGCONFIG(TAG, "  Selectable input sources: not yet known");
   }
+  if (rta_configured_) {
+    ESP_LOGCONFIG(TAG, "  Spectrum analyser:");
+    ESP_LOGCONFIG(TAG, "    Requested: tap %u, channel mask 0x%04X, FFT order %u, avg %u ms, peak decay %u dB/s",
+                  rta_cfg_desired_.tap, rta_cfg_desired_.channel_mask, rta_cfg_desired_.fft_order,
+                  rta_cfg_desired_.avg_ms, rta_cfg_desired_.peak_decay_db_s);
+    ESP_LOGCONFIG(TAG, "    Poll interval: %" PRIu32 " ms (x %u channels)", rta_interval_ms_,
+                  rta_cfg_desired_.channel_mask ? __builtin_popcount(rta_cfg_desired_.channel_mask) : 0);
+    if (rta_phase_ == RtaPhase::UNSUPPORTED) {
+      ESP_LOGCONFIG(TAG, "    State: not supported by this firmware");
+    } else if (!rta_caps_valid_) {
+      ESP_LOGCONFIG(TAG, "    State: %s, capabilities not yet read", rta_enabled_ ? "enabled" : "idle");
+    } else {
+      ESP_LOGCONFIG(TAG, "    State: %s, %u bands (%u continuous bass), level zero %u",
+                    rta_enabled_ ? "enabled" : "idle", rta_caps_.max_bands, rta_caps_.bass_bands,
+                    rta_caps_.level_zero);
+      ESP_LOGCONFIG(TAG, "    Applied: tap %u, channel mask 0x%04X, FFT order %u", rta_cfg_applied_.tap,
+                    rta_cfg_applied_.channel_mask, rta_cfg_applied_.fft_order);
+    }
+    ESP_LOGCONFIG(TAG, "    Counters: %" PRIu32 " frames, %" PRIu32 " dropped, %" PRIu32 " stale", rta_frames_,
+                  rta_dropped_, rta_stale_events_);
+  }
   ESP_LOGCONFIG(TAG, "  Counters: %" PRIu32 " bytes in, %" PRIu32 " notifications, %" PRIu32 " seq gaps, %" PRIu32
                      " bad CRC, %" PRIu32 " malformed, %" PRIu32 " timeouts, %" PRIu32 " dropped",
                 rx_bytes_, notify_count_, notify_gaps_, frames_bad_crc_, frames_malformed_, txn_timeouts_,
@@ -125,8 +151,11 @@ bool DSPiHub::enqueue_(const Transaction &txn) {
   // appended.  Dragging a volume slider produces one in-flight request and one
   // queued request holding the newest value, instead of a backlog that keeps
   // draining after the user has stopped.
+  // wvalue is part of the identity, not incidental: REQ_RTA_GET_BANDS carries
+  // the channel there and REQ_RTA_GET_CAPS the chunk index, so matching on the
+  // opcode alone would silently fold two different reads into one.
   for (auto &slot : queue_) {
-    if (slot.in_use && slot.req == txn.req && slot.frame_type == txn.frame_type) {
+    if (slot.in_use && slot.req == txn.req && slot.frame_type == txn.frame_type && slot.wvalue == txn.wvalue) {
       const uint8_t attempts = slot.attempts;
       slot = txn;
       slot.in_use = true;
@@ -178,11 +207,14 @@ int DSPiHub::find_next_() const {
 }
 
 void DSPiHub::enqueue_get_(uint8_t req, uint16_t wlen, void (DSPiHub::*cb)(const uint8_t *, uint16_t),
-                           uint8_t priority) {
+                           uint8_t priority, uint16_t wvalue) {
   Transaction t;
   t.req = req;
   t.frame_type = FRAME_GET_REQ;
-  t.wlen = wlen;  // caps the response size
+  // Not merely a cap: the device truncates its response to wlen, so asking for
+  // less than a command returns yields a short payload with a valid CRC.
+  t.wlen = wlen;
+  t.wvalue = wvalue;
   t.priority = priority;
   t.timeout_ms = request_timeout_ms_;
   t.on_ok = cb;
@@ -273,8 +305,12 @@ void DSPiHub::handle_response_(uint8_t type, uint8_t status, const uint8_t *payl
   // means the command is refused on this transport by design and will be
   // refused identically every time; retrying it would spin forever.
   ESP_LOGE(TAG, "Command 0x%02X rejected: %s", current_.req, ctrl_status_to_string(status));
+  auto fail_cb = current_.on_fail;
   has_current_ = false;
   hub_state_ = HubState::IDLE;
+  if (fail_cb) {
+    (this->*fail_cb)(status);
+  }
 }
 
 void DSPiHub::handle_notification_(const uint8_t *packet, uint16_t len) {
@@ -348,7 +384,11 @@ void DSPiHub::retry_or_drop_(const char *reason) {
   }
 
   current_.attempts++;
-  if (current_.attempts > max_retries_) {
+  // A transaction may cap its own retries below the hub's budget.  A spectrum
+  // band frame does: by the time a backoff has elapsed the frame it would
+  // fetch is stale, and the next poll asks for a fresher one anyway.
+  const uint8_t limit = current_.max_retries == Transaction::RETRIES_DEFAULT ? max_retries_ : current_.max_retries;
+  if (current_.attempts > limit) {
     ESP_LOGW(TAG, "Command 0x%02X failed after %u attempts (%s)", current_.req, current_.attempts, reason);
     fail_current_(reason);
     return;
@@ -371,12 +411,18 @@ void DSPiHub::retry_or_drop_(const char *reason) {
 }
 
 void DSPiHub::fail_current_(const char *reason) {
+  auto fail_cb = current_.on_fail;
   has_current_ = false;
   txn_dropped_++;
   hub_state_ = HubState::IDLE;
   if (++consecutive_failures_ >= FAILURES_BEFORE_OFFLINE) {
     ESP_LOGE(TAG, "DSPi unreachable (%s)", reason);
     go_offline_();
+  }
+  // After go_offline_(), so a state machine that reset itself there is not
+  // dragged back out by its own failure handler.
+  if (fail_cb) {
+    (this->*fail_cb)(CTRL_STATUS_LINK_FAILED);
   }
 }
 
@@ -391,6 +437,9 @@ void DSPiHub::go_offline_() {
   for (auto &slot : queue_) {
     slot.in_use = false;
   }
+  // Clearing the queue silently would strand any state machine waiting on a
+  // transaction that is now never going to complete.
+  reset_rta_();
   publish_state_();
 }
 
@@ -437,6 +486,19 @@ void DSPiHub::on_platform_(const uint8_t *data, uint16_t len) {
                /*priority=*/0);
   enqueue_get_(REQ_GET_ADAT_INPUT_ENABLE, 1, &DSPiHub::on_adat_enable_, /*priority=*/0);
   enqueue_get_(REQ_GET_ADAT_INPUT_PIN, 1, &DSPiHub::on_adat_pin_, /*priority=*/0);
+
+  // A device we have just identified may be a different one, or the same one
+  // running new firmware, so anything we concluded about its RTA support is
+  // now stale -- including a previous verdict of "unsupported".  Nothing is
+  // asked of it here: RTA capabilities are read lazily on the first enable, so
+  // a build with no spectrum page never sends an RTA byte.
+  rta_caps_valid_ = false;
+  rta_centres_have_ = 0;
+  reset_rta_();
+  if (rta_configured_ && rta_auto_enable_ && !rta_enabled_) {
+    set_rta_enabled(true);
+  }
+
   request_refresh();
 }
 
@@ -689,6 +751,499 @@ void DSPiHub::set_input_source(uint8_t source) {
 void DSPiHub::request_refresh() {
   refresh_due_at_ = millis() + refresh_debounce_ms_;
   refresh_pending_ = true;
+}
+
+// ---------------------------------------------------------------------------
+// Spectrum analyser (RTA)
+// ---------------------------------------------------------------------------
+//
+// The engine is transient: it starts on the first band read and stops itself
+// five seconds after the last one.  That shapes everything here.  There is no
+// explicit start, disabling is mostly a matter of ceasing to ask, and a device
+// nobody is watching costs nothing.
+//
+// Bring-up reads capabilities, then the band-centre table, then the applied
+// config, and only writes a config if the device's differs from ours.  The
+// read-back is not ceremony: the device boots with the output tap selected
+// across every output channel, so a silently failed write leaves an
+// eight-channel rotation that still draws a spectrum, just eight times too
+// slowly.  Comparing what came back is the only way to catch that.
+
+void DSPiHub::reset_rta_() {
+  rta_busy_ = false;
+  rta_centre_chunk_ = 1;
+  rta_poll_cursor_ = 0;
+  rta_seq_valid_ = 0;
+  rta_next_due_ = 0;
+  rta_status_due_ = 0;
+  rta_foreign_config_ = false;
+  rta_mark_not_live_();
+  if (!rta_configured_) {
+    rta_phase_ = RtaPhase::DISABLED;
+    return;
+  }
+  rta_phase_ = rta_enabled_ ? (rta_caps_valid_ ? RtaPhase::READ_CONFIG : RtaPhase::NEED_CAPS) : RtaPhase::DISABLED;
+}
+
+void DSPiHub::rta_advance_(RtaPhase next, uint32_t gap_ms) {
+  rta_phase_ = next;
+  rta_busy_ = false;
+  rta_next_due_ = millis() + gap_ms;
+}
+
+void DSPiHub::set_rta_enabled(bool enabled) {
+  if (!rta_configured_) {
+    ESP_LOGW(TAG, "RTA requested but no rta: block is configured");
+    return;
+  }
+  if (enabled == rta_enabled_)
+    return;
+  rta_enabled_ = enabled;
+
+  if (enabled) {
+    if (rta_phase_ == RtaPhase::UNSUPPORTED) {
+      ESP_LOGD(TAG, "RTA enable ignored: device does not support it");
+      return;
+    }
+    rta_busy_ = false;
+    rta_next_due_ = millis();
+    rta_phase_ = rta_caps_valid_ ? RtaPhase::READ_CONFIG : RtaPhase::NEED_CAPS;
+    ESP_LOGD(TAG, "RTA enabled");
+    return;
+  }
+
+  ESP_LOGD(TAG, "RTA disabled");
+  rta_mark_not_live_();
+  // Courtesy stop, so the DSPi drops the FFT and bass-bank work now rather
+  // than when its idle timer expires.  If it fails, nothing is lost: the
+  // engine switches itself off a few seconds later anyway.
+  if (rta_phase_ == RtaPhase::STREAMING && !rta_busy_ && is_online()) {
+    rta_phase_ = RtaPhase::STOPPING;
+    rta_next_due_ = millis();
+  } else {
+    rta_phase_ = RtaPhase::DISABLED;
+    rta_busy_ = false;
+  }
+}
+
+void DSPiHub::rta_reset_avg() {
+  if (rta_phase_ != RtaPhase::STREAMING)
+    return;
+  Transaction t;
+  t.req = REQ_RTA_CONTROL;
+  // Write-as-read: the action rides in wValue on the GET path.
+  t.frame_type = FRAME_GET_REQ;
+  t.wvalue = RTA_CTL_RESET_AVG;
+  t.wlen = 1;
+  t.priority = 1;
+  t.timeout_ms = request_timeout_ms_;
+  enqueue_(t);
+}
+
+void DSPiHub::set_rta_tap(uint8_t tap) {
+  if (rta_cfg_desired_.tap == tap)
+    return;
+  rta_cfg_desired_.tap = tap;
+  if (rta_enabled_ && rta_phase_ != RtaPhase::UNSUPPORTED) {
+    rta_advance_(RtaPhase::READ_CONFIG);
+  }
+}
+
+void DSPiHub::set_rta_channel_mask(uint16_t mask) {
+  if (!mask || rta_cfg_desired_.channel_mask == mask)
+    return;
+  rta_cfg_desired_.channel_mask = mask;
+  if (rta_enabled_ && rta_phase_ != RtaPhase::UNSUPPORTED) {
+    rta_advance_(RtaPhase::READ_CONFIG);
+  }
+}
+
+void DSPiHub::enqueue_rta_get_(uint8_t req, uint16_t wvalue, uint16_t wlen,
+                               void (DSPiHub::*cb)(const uint8_t *, uint16_t), void (DSPiHub::*fail_cb)(uint8_t),
+                               uint8_t priority, uint8_t max_retries) {
+  Transaction t;
+  t.req = req;
+  t.frame_type = FRAME_GET_REQ;
+  t.wvalue = wvalue;
+  // Always the full structure length: the device truncates to wlen.
+  t.wlen = wlen;
+  t.priority = priority;
+  t.max_retries = max_retries;
+  t.timeout_ms = request_timeout_ms_;
+  t.on_ok = cb;
+  t.on_fail = fail_cb;
+  if (enqueue_(t)) {
+    rta_busy_ = true;
+  } else {
+    // The queue is full of work that outranks a spectrum poll. Wait a beat
+    // rather than re-offering it on every loop iteration.
+    rta_next_due_ = millis() + rta_interval_ms_;
+  }
+}
+
+void DSPiHub::enqueue_rta_set_config_() {
+  Transaction t;
+  t.req = REQ_RTA_SET_CONFIG;
+  t.frame_type = FRAME_SET_REQ;
+  t.wlen = RTA_CONFIG_LEN;
+  t.payload_len = RTA_CONFIG_LEN;
+  rta_write_config(t.payload, rta_cfg_desired_);
+  t.priority = 1;
+  t.timeout_ms = request_timeout_ms_;
+  t.on_ok = &DSPiHub::on_rta_config_;
+  t.on_fail = &DSPiHub::on_rta_setup_failed_;
+  if (enqueue_(t)) {
+    rta_busy_ = true;
+  } else {
+    rta_next_due_ = millis() + rta_interval_ms_;
+  }
+}
+
+uint8_t DSPiHub::rta_next_poll_channel_() {
+  if (!rta_poll_mask_)
+    return 0xFF;
+  for (uint8_t i = 0; i < 16; i++) {
+    const uint8_t ch = static_cast<uint8_t>((rta_poll_cursor_ + i) % 16);
+    if (rta_poll_mask_ & (1u << ch)) {
+      rta_poll_cursor_ = static_cast<uint8_t>((ch + 1) % 16);
+      return ch;
+    }
+  }
+  return 0xFF;
+}
+
+void DSPiHub::rta_mark_not_live_() {
+  if (!rta_live_)
+    return;
+  rta_live_ = false;
+  rta_stale_events_++;
+  // Edge-triggered: one final update carrying the last good frame marked dead,
+  // so a display can dim what it has.  Repeating this every poll interval
+  // would cost a redraw a frame for a spectrum that is not moving.
+  rta_last_update_.live = false;
+  rta_band_frame_callback_.call(rta_last_update_);
+}
+
+void DSPiHub::service_rta_(uint32_t now) {
+  if (!rta_configured_ || rta_busy_ || !identified_)
+    return;
+  if (hub_state_ == HubState::OFFLINE)
+    return;
+  // Wrap-safe "now >= rta_next_due_".
+  if ((now - rta_next_due_) >= 0x80000000UL)
+    return;
+
+  switch (rta_phase_) {
+    case RtaPhase::DISABLED:
+    case RtaPhase::UNSUPPORTED:
+      return;
+
+    case RtaPhase::NEED_CAPS:
+      enqueue_rta_get_(REQ_RTA_GET_CAPS, 0, RTA_CAPS_LEN, &DSPiHub::on_rta_caps_, &DSPiHub::on_rta_setup_failed_);
+      return;
+
+    case RtaPhase::NEED_CENTRES:
+      enqueue_rta_get_(REQ_RTA_GET_CAPS, rta_centre_chunk_, RTA_CENTRES_CHUNK_LEN, &DSPiHub::on_rta_centres_,
+                       &DSPiHub::on_rta_optional_failed_);
+      return;
+
+    case RtaPhase::READ_CONFIG:
+    case RtaPhase::VERIFY_CONFIG:
+      enqueue_rta_get_(REQ_RTA_GET_CONFIG, 0, RTA_CONFIG_LEN, &DSPiHub::on_rta_config_,
+                       &DSPiHub::on_rta_setup_failed_);
+      return;
+
+    case RtaPhase::SET_CONFIG:
+      enqueue_rta_set_config_();
+      return;
+
+    case RtaPhase::STOPPING:
+      enqueue_rta_get_(REQ_RTA_CONTROL, RTA_CTL_STOP, 1, &DSPiHub::on_rta_control_,
+                       &DSPiHub::on_rta_optional_failed_, /*priority=*/1, /*max_retries=*/0);
+      return;
+
+    case RtaPhase::STREAMING: {
+      // Status is read occasionally to notice a device that rebooted and lost
+      // our config.  It deliberately does not count as a read for the idle
+      // timer, so it can never keep the engine alive on its own and mask a
+      // band-read path that has stopped working.
+      if ((now - rta_status_due_) < 0x80000000UL) {
+        rta_status_due_ = now + rta_status_interval_ms_;
+        enqueue_rta_get_(REQ_RTA_GET_STATUS, 0, RTA_STATUS_LEN, &DSPiHub::on_rta_status_,
+                         &DSPiHub::on_rta_optional_failed_);
+        return;
+      }
+      const uint8_t ch = rta_next_poll_channel_();
+      if (ch == 0xFF) {
+        ESP_LOGW(TAG, "RTA has no channels left to poll");
+        rta_phase_ = RtaPhase::UNSUPPORTED;
+        return;
+      }
+      // Priority 2 keeps a spectrum poll behind both user commands and the
+      // background refresh, and makes it the first thing evicted if the queue
+      // fills.  Frames are worthless once stale, so they are never retried.
+      enqueue_rta_get_(REQ_RTA_GET_BANDS, ch, RTA_BAND_FRAME_LEN, &DSPiHub::on_rta_bands_,
+                       &DSPiHub::on_rta_bands_failed_, /*priority=*/2, /*max_retries=*/0);
+      return;
+    }
+  }
+}
+
+void DSPiHub::on_rta_caps_(const uint8_t *data, uint16_t len) {
+  RtaCaps caps{};
+  if (!rta_parse_caps(data, len, &caps)) {
+    ESP_LOGW(TAG, "Short RTA caps response (%u bytes)", len);
+    rta_advance_(RtaPhase::NEED_CAPS, rta_interval_ms_);
+    return;
+  }
+
+  if (caps.version != RTA_CFG_VERSION) {
+    // No best-effort parse.  V3 renumbered the band-frame indices relative to
+    // V2, so guessing would draw a plausible but wrong spectrum -- worse than
+    // drawing none.
+    ESP_LOGE(TAG, "RTA protocol version %u is not supported (need %u)", caps.version, RTA_CFG_VERSION);
+    rta_phase_ = RtaPhase::UNSUPPORTED;
+    rta_busy_ = false;
+    return;
+  }
+
+  rta_caps_ = caps;
+  rta_caps_valid_ = true;
+  if (rta_caps_.max_bands > RTA_MAX_BANDS) {
+    ESP_LOGW(TAG, "Device reports %u bands, clamping to %u", rta_caps_.max_bands, RTA_MAX_BANDS);
+    rta_caps_.max_bands = RTA_MAX_BANDS;
+  }
+  ESP_LOGD(TAG, "RTA caps: %u bands (%u continuous bass), level zero %u, order %u-%u, %u in / %u out",
+           rta_caps_.max_bands, rta_caps_.bass_bands, rta_caps_.level_zero, rta_caps_.fft_order_min,
+           rta_caps_.fft_order_max, rta_caps_.input_channels, rta_caps_.output_channels);
+
+  // The device masks channel bits it does not have and only refuses outright
+  // when nothing is left, so an out-of-range bit would otherwise vanish in
+  // silence.
+  const uint8_t width = rta_cfg_desired_.tap == RTA_TAP_OUTPUT ? rta_caps_.output_channels : rta_caps_.input_channels;
+  const uint16_t valid = width >= 16 ? 0xFFFF : static_cast<uint16_t>((1u << width) - 1u);
+  if (rta_cfg_desired_.channel_mask & ~valid) {
+    ESP_LOGW(TAG, "RTA channel_mask 0x%04X exceeds the %u channels at this tap; the device will ignore the extra bits",
+             rta_cfg_desired_.channel_mask, width);
+  }
+  if (rta_cfg_desired_.fft_order < rta_caps_.fft_order_min || rta_cfg_desired_.fft_order > rta_caps_.fft_order_max) {
+    ESP_LOGW(TAG, "RTA fft_order %u is outside the device's %u-%u; using %u", rta_cfg_desired_.fft_order,
+             rta_caps_.fft_order_min, rta_caps_.fft_order_max, rta_caps_.fft_order_default);
+    rta_cfg_desired_.fft_order = rta_caps_.fft_order_default;
+  }
+
+  rta_centres_have_ = 0;
+  rta_centre_chunk_ = 1;
+  rta_advance_(rta_caps_.max_bands ? RtaPhase::NEED_CENTRES : RtaPhase::READ_CONFIG);
+}
+
+void DSPiHub::on_rta_centres_(const uint8_t *data, uint16_t len) {
+  const uint8_t want = rta_caps_.max_bands;
+  const uint16_t got = static_cast<uint16_t>(len / 2);
+  for (uint16_t i = 0; i < got && rta_centres_have_ < want && rta_centres_have_ < RTA_MAX_BANDS; i++) {
+    rta_band_centre_hz_[rta_centres_have_++] = rta_rd_u16(data, static_cast<uint16_t>(i * 2));
+  }
+
+  // Stop on having collected what caps promised, rather than on the first
+  // chunk that errors: a chunk past the end is refused, and treating that as
+  // the end of the table would hide a genuine fault behind a normal condition.
+  if (rta_centres_have_ >= want || got == 0) {
+    ESP_LOGD(TAG, "RTA band centres: %u of %u (%u Hz .. %u Hz)", rta_centres_have_, want,
+             rta_centres_have_ ? rta_band_centre_hz_[0] : 0,
+             rta_centres_have_ ? rta_band_centre_hz_[rta_centres_have_ - 1] : 0);
+    rta_advance_(RtaPhase::READ_CONFIG);
+    return;
+  }
+  rta_centre_chunk_++;
+  rta_advance_(RtaPhase::NEED_CENTRES);
+}
+
+void DSPiHub::on_rta_config_(const uint8_t *data, uint16_t len) {
+  // Reached from three phases: the initial read, the response to our write,
+  // and the verify read.  A SET response carries no payload, so a short
+  // response here simply means "go and read it back".
+  if (rta_phase_ == RtaPhase::SET_CONFIG) {
+    rta_advance_(RtaPhase::VERIFY_CONFIG);
+    return;
+  }
+
+  RtaConfig applied{};
+  if (!rta_parse_config(data, len, &applied)) {
+    ESP_LOGW(TAG, "Short RTA config response (%u bytes)", len);
+    rta_advance_(RtaPhase::READ_CONFIG, rta_interval_ms_);
+    return;
+  }
+  rta_cfg_applied_ = applied;
+
+  const bool matches = applied.tap == rta_cfg_desired_.tap && applied.channel_mask == rta_cfg_desired_.channel_mask &&
+                       applied.fft_order == rta_cfg_desired_.fft_order && applied.flags == rta_cfg_desired_.flags;
+
+  if (!matches) {
+    if (rta_phase_ == RtaPhase::VERIFY_CONFIG) {
+      // The device clamps avg_ms and peak_decay_db_s rather than rejecting
+      // them, so a difference in those is legitimate and already excluded
+      // above.  A difference in the rest is not, and matters: its boot default
+      // is every output channel, which still draws, just far too slowly.
+      ESP_LOGE(TAG,
+               "RTA config was not applied: asked for tap %u mask 0x%04X order %u, device reports tap %u mask 0x%04X "
+               "order %u",
+               rta_cfg_desired_.tap, rta_cfg_desired_.channel_mask, rta_cfg_desired_.fft_order, applied.tap,
+               applied.channel_mask, applied.fft_order);
+    } else {
+      rta_advance_(RtaPhase::SET_CONFIG);
+      return;
+    }
+  }
+
+  // Poll only the channels the device actually accepted.
+  rta_poll_mask_ = applied.channel_mask;
+  rta_poll_cursor_ = 0;
+  rta_seq_valid_ = 0;
+  rta_status_due_ = millis() + rta_status_interval_ms_;
+  ESP_LOGD(TAG, "RTA streaming: tap %u, mask 0x%04X, order %u, avg %u ms, peak decay %u dB/s", applied.tap,
+           applied.channel_mask, applied.fft_order, applied.avg_ms, applied.peak_decay_db_s);
+  rta_advance_(RtaPhase::STREAMING);
+}
+
+void DSPiHub::on_rta_bands_(const uint8_t *data, uint16_t len) {
+  rta_busy_ = false;
+  rta_next_due_ = millis() + rta_interval_ms_;
+
+  RtaBandFrame frame{};
+  if (!rta_parse_band_frame(data, len, &frame)) {
+    ESP_LOGW(TAG, "Bad RTA band frame (%u bytes, version %u)", len, len ? data[0] : 0);
+    rta_dropped_++;
+    return;
+  }
+
+  // The engine reports zero bands while it is idle: its band table is only
+  // built once it starts, and the read that started it returns the frame from
+  // before that happened.  Publishing it would blank every bar for a frame.
+  if (frame.n_bands == 0) {
+    return;
+  }
+
+  const uint8_t ch = frame.channel;
+  const bool stale = frame.age_ms == RTA_AGE_NEVER || frame.age_ms > rta_stale_ms_;
+  if (stale) {
+    rta_mark_not_live_();
+    return;
+  }
+
+  const bool seq_known = ch < 16 && (rta_seq_valid_ & (1u << ch));
+  if (seq_known && rta_last_seq_[ch] == frame.seq && rta_live_) {
+    // Same frame we already published: the poll interval simply beat the
+    // device's frame rate.  Not an error, and not a redraw.
+    return;
+  }
+  if (ch < 16) {
+    rta_last_seq_[ch] = frame.seq;
+    rta_seq_valid_ |= static_cast<uint16_t>(1u << ch);
+  }
+
+  rta_frames_++;
+  rta_live_ = true;
+  rta_last_update_.frame = frame;
+  rta_last_update_.level_zero = rta_caps_.level_zero;
+  rta_last_update_.live = true;
+  rta_band_frame_callback_.call(rta_last_update_);
+}
+
+void DSPiHub::on_rta_status_(const uint8_t *data, uint16_t len) {
+  rta_busy_ = false;
+  rta_next_due_ = millis();
+
+  if (!rta_parse_status(data, len, &rta_status_)) {
+    ESP_LOGW(TAG, "Short RTA status response (%u bytes)", len);
+    return;
+  }
+
+  // The analyser is one engine with one global config, shared by every client
+  // on every transport. If a USB host reconfigures it, we see its settings
+  // rather than ours.
+  //
+  // Do not "correct" that. An earlier version reapplied our config whenever
+  // the tap differed, which against a running DSPi-Console turned into a
+  // config war: each side rewrote the other's tap every couple of seconds,
+  // restarting the frame and clearing the averaging each time. There is no way
+  // to distinguish another client's deliberate change from a device that
+  // rebooted and lost our settings, and of the two, fighting is much the worse
+  // failure. A reboot is caught anyway by the link dropping and the probe
+  // re-running, which resets this state machine from the top.
+  //
+  // So adapt instead: report it once, and draw whatever the device is
+  // actually analysing.
+  if (rta_status_.tap != rta_cfg_desired_.tap) {
+    if (!rta_foreign_config_) {
+      rta_foreign_config_ = true;
+      ESP_LOGI(TAG, "RTA is configured by another client (tap %u, we asked for %u); following it", rta_status_.tap,
+               rta_cfg_desired_.tap);
+    }
+  } else if (rta_foreign_config_) {
+    rta_foreign_config_ = false;
+    ESP_LOGI(TAG, "RTA is back on our own configuration (tap %u)", rta_status_.tap);
+  }
+}
+
+void DSPiHub::on_rta_control_(const uint8_t *data, uint16_t len) {
+  (void) data;
+  (void) len;
+  rta_busy_ = false;
+  if (rta_phase_ == RtaPhase::STOPPING) {
+    rta_phase_ = RtaPhase::DISABLED;
+  }
+}
+
+void DSPiHub::on_rta_setup_failed_(uint8_t status) {
+  rta_busy_ = false;
+  if (status == CTRL_STATUS_LINK_FAILED) {
+    // Never heard back, rather than refused.  The link is the problem, not the
+    // feature, so keep the verdict open and try again after a pause.
+    ESP_LOGW(TAG, "RTA setup did not complete; retrying");
+    rta_next_due_ = millis() + 1000;
+    return;
+  }
+  // A permanent rejection here means the firmware does not implement these
+  // opcodes, or refused our config outright.  Retrying either would spin.
+  ESP_LOGW(TAG, "RTA unavailable on firmware %u.%u.%u (%s)", fw_major_, fw_minor_, fw_patch_,
+           ctrl_status_to_string(status));
+  rta_phase_ = RtaPhase::UNSUPPORTED;
+}
+
+void DSPiHub::on_rta_bands_failed_(uint8_t status) {
+  rta_busy_ = false;
+  rta_dropped_++;
+  rta_next_due_ = millis() + rta_interval_ms_;
+
+  // A refused channel is one the device does not have at this tap.  Drop it
+  // and keep the others rather than stopping the whole display.
+  if (status != CTRL_STATUS_LINK_FAILED && !ctrl_status_is_retryable(status)) {
+    const uint8_t ch = current_.wvalue < 16 ? static_cast<uint8_t>(current_.wvalue) : 0;
+    if (rta_poll_mask_ & (1u << ch)) {
+      ESP_LOGW(TAG, "RTA channel %u refused (%s); dropping it", ch, ctrl_status_to_string(status));
+      rta_poll_mask_ &= static_cast<uint16_t>(~(1u << ch));
+    }
+  }
+}
+
+void DSPiHub::on_rta_optional_failed_(uint8_t status) {
+  // Centres, status and the courtesy stop are all non-fatal: without centres
+  // the axis labels degrade, without status a device reboot is noticed late,
+  // and a failed stop just means waiting for the device's own idle timeout.
+  ESP_LOGD(TAG, "Optional RTA request failed (%s)", ctrl_status_to_string(status));
+  rta_busy_ = false;
+  switch (rta_phase_) {
+    case RtaPhase::NEED_CENTRES:
+      ESP_LOGW(TAG, "RTA band centres unavailable; frequency labels will be missing");
+      rta_advance_(RtaPhase::READ_CONFIG);
+      break;
+    case RtaPhase::STOPPING:
+      rta_phase_ = RtaPhase::DISABLED;
+      break;
+    default:
+      rta_next_due_ = millis() + rta_interval_ms_;
+      break;
+  }
 }
 
 }  // namespace dspi
