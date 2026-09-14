@@ -39,6 +39,30 @@ uart:
 dspi:
   id: dspi_hub
   uart_id: dspi_uart
+  # Non-default throughout, so every codegen path in the rta: block is
+  # exercised rather than just the defaults.
+  rta:
+    tap: input
+    channel_mask: 0x03
+    fft_order: 9
+    avg_ms: 100
+    peak_decay_db_s: 30
+    interval: 50ms
+    stale_timeout: 400ms
+    status_interval: 2s
+    # A device with no display has nothing to draw a spectrum on, so it must
+    # not ask the DSPi to spend FFT time producing one.
+    auto_enable: false
+  # The spectrum data reaches a config through a trigger, not an entity: a
+  # sensor per band would be dozens of Home Assistant entities updating at
+  # 20 Hz. This lambda also proves the whole RTA surface compiles with no
+  # display, lvgl or speaker anywhere in the config.
+  on_rta_band_frame:
+    - lambda: |-
+        ESP_LOGD("rta", "ch %u seq %u bands %u live %d first %.1f dBFS (%u Hz), frac %.2f",
+                 x.frame.channel, x.frame.seq, x.frame.n_bands, (int) x.live,
+                 x.db(x.frame.avg[0]), id(dspi_hub)->rta_band_centre_hz(0),
+                 x.fraction(x.frame.avg[0], -60.0f));
 
 number:
   # What a listener turns. Same field as the USB host's volume slider, and the

@@ -1,11 +1,13 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <string>
 #include <vector>
 
 #include "esphome/components/uart/uart.h"
 #include "esphome/core/component.h"
+#include "esphome/core/helpers.h"
 
 #include "framing.h"
 #include "protocol.h"
@@ -45,6 +47,26 @@ class DSPiStateListener {
   virtual void on_dspi_state(const DSPiState &state) = 0;
 };
 
+// What a consumer is handed when a new band frame arrives.
+//
+// It carries the wire frame plus the little the device reports separately but
+// a renderer cannot do without: the level zero point from RtaCaps, so nothing
+// downstream hard-codes 243, and whether the data is actually live.
+struct RtaBandUpdate {
+  RtaBandFrame frame{};
+  uint8_t level_zero{RTA_LEVEL_ZERO_DBFS};
+  // False when the analyser is idle, the channel has never published, or the
+  // newest frame has aged past the staleness window.  The frame still holds
+  // the last good data, so a consumer can dim it rather than blanking it.
+  bool live{false};
+
+  float db(uint8_t v) const { return rta_level_to_dbfs(v, level_zero); }
+  bool is_floor(uint8_t v) const { return rta_level_is_floor(v); }
+  float fraction(uint8_t v, float floor_db, float top_db = 0.0f) const {
+    return rta_level_to_fraction(v, level_zero, floor_db, top_db);
+  }
+};
+
 class DSPiHub;
 
 // One request awaiting transmission or a response.
@@ -59,11 +81,21 @@ struct Transaction {
   uint8_t payload[MAX_TX_PAYLOAD]{};
   uint8_t payload_len{0};
   uint8_t attempts{0};
-  // 0 = user-initiated, 1 = background refresh.  Lower runs first, so a
-  // volume change never queues behind a refresh burst.
+  // 0 = user-initiated, 1 = background refresh, 2 = spectrum streaming.  Lower
+  // runs first, so a volume change never queues behind a refresh burst, and a
+  // spectrum poll is the first thing evicted when the queue fills.
   uint8_t priority{1};
+  // Retries allowed for this transaction, or RETRIES_DEFAULT to use the hub's
+  // max_retries_.  Band polls set 0: a frame retried after a backoff is stale
+  // by the time it lands, and the next poll re-asks for a fresher one anyway.
+  static constexpr uint8_t RETRIES_DEFAULT = 0xFF;
+  uint8_t max_retries{RETRIES_DEFAULT};
   uint32_t timeout_ms{0};
   void (DSPiHub::*on_ok)(const uint8_t *data, uint16_t len){nullptr};
+  // Called when this transaction ends without an OK: a permanent rejection, or
+  // retries exhausted.  Without it a state machine that tracks "one request
+  // outstanding" deadlocks the first time the device answers ERROR.
+  void (DSPiHub::*on_fail)(uint8_t status){nullptr};
   bool in_use{false};
 };
 
@@ -89,6 +121,60 @@ class DSPiHub : public Component, public uart::UARTDevice {
   }
 
   void register_listener(DSPiStateListener *l) { listeners_.push_back(l); }
+
+  // --- spectrum analyser (RTA) ---------------------------------------------
+  //
+  // Configured from codegen; no `rta:` block means set_rta_config() is never
+  // called, rta_configured_ stays false, and the component never sends a single
+  // RTA byte.  A wall knob pays nothing for a feature it does not use.
+  void set_rta_config(const RtaConfig &cfg) {
+    rta_cfg_desired_ = cfg;
+    rta_configured_ = true;
+  }
+  void set_rta_interval(uint32_t ms) { rta_interval_ms_ = ms; }
+  void set_rta_status_interval(uint32_t ms) { rta_status_interval_ms_ = ms; }
+  void set_rta_stale_timeout(uint32_t ms) { rta_stale_ms_ = ms; }
+  void set_rta_auto_enable(bool b) { rta_auto_enable_ = b; }
+
+  // Start or stop polling.  This is what a display calls when its spectrum
+  // page is shown or hidden.
+  //
+  // Disabling sends one best-effort RTA_CTL_STOP and stops polling; it does not
+  // set RTA_FLAG_MANUAL.  With MANUAL the device's own idle timeout is
+  // disabled, so if this component crashes, reboots, or loses the UART with the
+  // page open, the analyser would run forever -- burning main-loop FFT time and
+  // the per-channel bass bank, which is synchronous audio work on both of the
+  // DSPi's cores.  Leaving auto-off in place makes our stop advisory: another
+  // client's next read restarts the engine, and there is no run state to
+  // reconcile after a device reboot.
+  void set_rta_enabled(bool enabled);
+  void rta_reset_avg();
+  void set_rta_tap(uint8_t tap);
+  void set_rta_channel_mask(uint16_t mask);
+
+  void add_on_rta_band_frame_callback(std::function<void(const RtaBandUpdate &)> &&cb) {
+    rta_band_frame_callback_.add(std::move(cb));
+  }
+
+  // True once caps have been read, the device reported protocol V3, and our
+  // config was accepted.  False on a firmware with no RTA, or one speaking a
+  // different protocol version.
+  bool rta_available() const { return rta_caps_valid_ && rta_phase_ != RtaPhase::UNSUPPORTED; }
+  bool rta_enabled() const { return rta_enabled_; }
+  const RtaCaps &rta_caps() const { return rta_caps_; }
+  const RtaConfig &rta_applied_config() const { return rta_cfg_applied_; }
+  const RtaStatus &rta_status() const { return rta_status_; }
+  // True when the analyser is running someone else's configuration. The DSPi
+  // has one engine shared by every client, so this is normal rather than an
+  // error: what we draw is then that client's tap, not ours.
+  bool rta_foreign_config() const { return rta_foreign_config_; }
+  const RtaBandUpdate &rta_last_band_frame() const { return rta_last_update_; }
+  // Nominal third-octave centre in Hz, or 0 if the centre table could not be
+  // read (which is non-fatal: axis labels degrade, the spectrum still works).
+  uint16_t rta_band_centre_hz(uint8_t band) const {
+    return band < RTA_MAX_BANDS ? rta_band_centre_hz_[band] : 0;
+  }
+  float rta_level_db(uint8_t v) const { return rta_level_to_dbfs(v, rta_caps_.level_zero); }
 
   // Control surface, usable from a lambda with no entity configured.
   void set_master_volume_db(float db);
@@ -118,13 +204,30 @@ class DSPiHub : public Component, public uart::UARTDevice {
     OFFLINE,     // repeated failures; reprobing slowly
   };
 
+  // Where the RTA state machine is in bringing the analyser up.  It owns at
+  // most one queued transaction at a time, which bounds its share of the queue
+  // to one slot and makes the pacing fall out of completion rather than needing
+  // a separate rate limiter.
+  enum class RtaPhase : uint8_t {
+    DISABLED,        // not enabled, or no rta: block at all
+    UNSUPPORTED,     // device has no RTA, or speaks a different protocol version
+    NEED_CAPS,       // read RtaCaps
+    NEED_CENTRES,    // read the band-centre table, chunk by chunk
+    READ_CONFIG,     // read the applied config before deciding to write
+    SET_CONFIG,      // write our config
+    VERIFY_CONFIG,   // read it back; the device clamps rather than rejecting
+    STREAMING,       // polling band frames
+    STOPPING,        // sending the courtesy RTA_CTL_STOP
+  };
+
   // --- queue ---------------------------------------------------------------
   static constexpr uint8_t QUEUE_DEPTH = 8;
   std::array<Transaction, QUEUE_DEPTH> queue_{};
 
   bool enqueue_(const Transaction &txn);
   int find_next_() const;
-  void enqueue_get_(uint8_t req, uint16_t wlen, void (DSPiHub::*cb)(const uint8_t *, uint16_t), uint8_t priority = 1);
+  void enqueue_get_(uint8_t req, uint16_t wlen, void (DSPiHub::*cb)(const uint8_t *, uint16_t), uint8_t priority = 1,
+                    uint16_t wvalue = 0);
 
   // --- transport -----------------------------------------------------------
   void pump_rx_();
@@ -154,6 +257,26 @@ class DSPiHub : public Component, public uart::UARTDevice {
   void on_input_source_(const uint8_t *data, uint16_t len);
   void publish_state_();
 
+  // --- RTA -----------------------------------------------------------------
+  void service_rta_(uint32_t now);
+  void reset_rta_();
+  void rta_advance_(RtaPhase next, uint32_t gap_ms = 0);
+  void enqueue_rta_get_(uint8_t req, uint16_t wvalue, uint16_t wlen,
+                        void (DSPiHub::*cb)(const uint8_t *, uint16_t), void (DSPiHub::*fail_cb)(uint8_t),
+                        uint8_t priority = 1, uint8_t max_retries = Transaction::RETRIES_DEFAULT);
+  void enqueue_rta_set_config_();
+  void on_rta_caps_(const uint8_t *data, uint16_t len);
+  void on_rta_centres_(const uint8_t *data, uint16_t len);
+  void on_rta_config_(const uint8_t *data, uint16_t len);
+  void on_rta_bands_(const uint8_t *data, uint16_t len);
+  void on_rta_status_(const uint8_t *data, uint16_t len);
+  void on_rta_control_(const uint8_t *data, uint16_t len);
+  void on_rta_setup_failed_(uint8_t status);
+  void on_rta_bands_failed_(uint8_t status);
+  void on_rta_optional_failed_(uint8_t status);
+  uint8_t rta_next_poll_channel_();
+  void rta_mark_not_live_();
+
   FrameParser parser_;
   HubState hub_state_{HubState::INIT};
   Transaction current_{};
@@ -176,13 +299,48 @@ class DSPiHub : public Component, public uart::UARTDevice {
   DSPiState state_{};
   std::vector<DSPiStateListener *> listeners_;
 
+  // --- RTA state -----------------------------------------------------------
+  RtaPhase rta_phase_{RtaPhase::DISABLED};
+  bool rta_configured_{false};  // an rta: block exists
+  bool rta_enabled_{false};     // a consumer wants frames right now
+  bool rta_busy_{false};        // one RTA transaction outstanding
+  uint32_t rta_next_due_{0};
+  uint32_t rta_status_due_{0};
+  RtaConfig rta_cfg_desired_{};
+  RtaConfig rta_cfg_applied_{};
+  RtaCaps rta_caps_{};
+  bool rta_caps_valid_{false};
+  RtaStatus rta_status_{};
+  uint16_t rta_band_centre_hz_[RTA_MAX_BANDS]{};
+  uint8_t rta_centres_have_{0};   // centres collected so far
+  uint16_t rta_centre_chunk_{1};  // wValue of the chunk being read
+  // Channels still answering.  Starts as the applied channel_mask and loses any
+  // channel the device refuses, so one bad index does not stop the others.
+  uint16_t rta_poll_mask_{0};
+  uint8_t rta_poll_cursor_{0};
+  uint8_t rta_last_seq_[16]{};
+  uint16_t rta_seq_valid_{0};  // bit N: rta_last_seq_[N] holds a real seq
+  RtaBandUpdate rta_last_update_{};
+  bool rta_live_{false};
+  // Another client owns the analyser's config. Latched so it is reported once
+  // rather than every status poll.
+  bool rta_foreign_config_{false};
+  CallbackManager<void(const RtaBandUpdate &)> rta_band_frame_callback_{};
+
   // Configuration.
   uint32_t request_timeout_ms_{400};
   uint32_t flash_timeout_ms_{1500};
   uint32_t backoff_base_ms_{60};
   uint32_t poll_interval_ms_{0};
   uint32_t refresh_debounce_ms_{250};
-  uint16_t max_bytes_per_loop_{64};
+  // One 89-byte band-frame response (sync + type + 3 header + 82 + 2 CRC) plus
+  // a notification must drain in a single pass, or a frame sits half-parsed
+  // while its own timeout runs down.
+  uint16_t max_bytes_per_loop_{128};
+  uint32_t rta_interval_ms_{50};
+  uint32_t rta_status_interval_ms_{2000};
+  uint32_t rta_stale_ms_{500};
+  bool rta_auto_enable_{false};
   uint8_t max_retries_{4};
   bool expect_notifications_{true};
   uint8_t boot_input_source_{INPUT_SOURCE_I2S};
@@ -197,6 +355,9 @@ class DSPiHub : public Component, public uart::UARTDevice {
   uint32_t txn_timeouts_{0};
   uint32_t notify_gaps_{0};
   uint32_t notify_count_{0};
+  uint32_t rta_frames_{0};
+  uint32_t rta_dropped_{0};
+  uint32_t rta_stale_events_{0};
 
   // Device identity, logged once the probe succeeds.
   uint8_t fw_major_{0}, fw_minor_{0}, fw_patch_{0}, platform_id_{0};

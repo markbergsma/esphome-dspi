@@ -18,6 +18,7 @@ Currently only basic functionality is supported:
 - User & master volume (in dB)
 - Mute (all outputs)
 - Input source select
+- Spectrum analyser (RTA) band data, for driving a display — see [docs/spectrum-analyzer.md](docs/spectrum-analyzer.md)
 
 ## Quick start
 
@@ -137,8 +138,9 @@ select:
 | `backoff_base` | `60ms` | First retry delay; doubles up to 4 steps. |
 | `poll_interval` | `0s` | Fallback polling. Leave at 0 when notifications are on. |
 | `refresh_debounce` | `250ms` | Coalescing window for notification-driven re-reads. |
-| `max_bytes_per_loop` | `64` | UART bytes drained per `loop()` call. |
+| `max_bytes_per_loop` | `128` | UART bytes drained per `loop()` call. |
 | `boot_input_source` | unset | `usb` / `spdif` / `i2s`. Claimed once at boot, if different. |
+| `rta` | unset | Spectrum analyser. Absent means no RTA traffic at all. See [docs/spectrum-analyzer.md](docs/spectrum-analyzer.md). |
 
 ### `number` — the two volumes
 
@@ -215,6 +217,7 @@ the result in `dump_config`:
 ```
 [C][dspi]:   Selectable input sources: USB, S/PDIF, I2S
 ```
+
 
 ## Using it without any entities
 
