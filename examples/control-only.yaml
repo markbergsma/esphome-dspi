@@ -37,10 +37,7 @@ psram:
   speed: 80MHz
 
 external_components:
-  - source:
-      type: local
-      path: ../components
-        
+  - source: github://markbergsma/esphome-dspi@main
     components: [dspi]
 
 logger:
