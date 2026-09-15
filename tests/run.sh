@@ -20,8 +20,13 @@ echo "== esphome config =="
 # validated through a scratch copy pointing at this working tree instead --
 # otherwise CI would be testing whatever is published rather than this commit.
 # tests/standalone.yaml already uses a local path and needs no such treatment.
+#
+# Both spellings are rewritten: the published github:// source, and a relative
+# local path. The scratch copy lives outside the repository, so a path relative
+# to the example's own directory would not resolve there.
 mkdir -p "$out/examples"
-sed 's|source: github://markbergsma/esphome-dspi@main|source: {type: local, path: PLACEHOLDER}|' \
+sed -e 's|source: github://markbergsma/esphome-dspi@main|source: {type: local, path: PLACEHOLDER}|' \
+    -e 's|path: \.\./components|path: PLACEHOLDER|' \
   examples/control-only.yaml >"$out/examples/control-only.yaml"
 sed -i.bak "s|PLACEHOLDER|$PWD/components|" "$out/examples/control-only.yaml"
 cp examples/secrets.yaml "$out/examples/secrets.yaml" 2>/dev/null || cat >"$out/examples/secrets.yaml" <<'EOF'
