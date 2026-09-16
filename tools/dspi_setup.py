@@ -17,6 +17,13 @@ Two kinds of setting are involved, and they persist differently:
     save it. Without that, the DSPi reverts on its next reboot and ends up
     driving BCK/LRCLK while the ESP32 is also driving them.
 
+The slave clock pair is a wiring decision, not just a setting. In split
+clock-pin mode the DSPi only ever LISTENS on that pair and never drives a
+clock of its own while slave-clocked, so a downstream I2S DAC has to take its
+BCK/LRCK from the same lines the external master drives -- the DSPi supplies
+only the output slot's data pin. Pick the pair with --slave-bck to match
+however the DAC is wired; see the README.
+
 Usage:
     pip install pyusb
     python3 dspi_setup.py                           # show state, change nothing
@@ -83,10 +90,16 @@ PIN_CONFIG_NAMES = {
 DEFAULT_UART_TX = 16
 DEFAULT_UART_RX = 17
 DEFAULT_BAUD = 460800
-# Slave clock pair. The default of 26/27 collides with some builds' output
-# wiring; 2/3 keeps the whole I2S input bundle on adjacent pins (data on GPIO
-# 1) and is free whenever the I2S input is stereo. See the README.
-DEFAULT_SLAVE_BCK = 2
+# Slave clock pair: the pins the external master drives, which a downstream
+# I2S DAC must share. 27/28 suits Pico DAC HATs that expect BCK/LRCK there, so
+# one clock net feeds both the DSPi and the DAC. Nothing binds you to it -- any
+# free sequential pair works, as long as the wiring matches. It also keeps the
+# I2S RX data-pin defaults (GPIO 1/2/3/4) clear, since split mode reserves both
+# clock pairs and a pair parked there would rule out multichannel input.
+DEFAULT_SLAVE_BCK = 27
+# Where to move the master pair if it collides with the slave pair. Only used
+# when --master-bck is given; 14/15 is the firmware default.
+FALLBACK_MASTER_BCK = 14
 
 
 class DSPi:
@@ -108,6 +121,11 @@ class DSPi:
 
 def status_name(code: int) -> str:
     return PIN_CONFIG_NAMES.get(code, f"UNKNOWN({code:#04x})")
+
+
+def pairs_overlap(a: int, b: int) -> bool:
+    """True if two BCK bases name pairs that share a GPIO (LRCLK is BCK + 1)."""
+    return abs(a - b) <= 1
 
 
 def show(d: DSPi) -> dict:
@@ -156,6 +174,7 @@ def show(d: DSPi) -> dict:
         "source": src,
         "clock_mode": mode,
         "pin_mode": pin_mode,
+        "master_bck": master_bck,
         "slave_bck": slave_bck,
     }
 
@@ -176,8 +195,30 @@ def apply_uart(d: DSPi, tx: int, rx: int, baud: int) -> bool:
     return True
 
 
-def apply_audio(d: DSPi, slave_bck: int, persist: bool) -> bool:
+def apply_audio(d: DSPi, slave_bck: int, master_bck: int | None,
+                current_master: int, persist: bool) -> bool:
     ok = True
+
+    # The two pairs are kept mutually distinct by the firmware, and a role-1 set
+    # is always validated against the master pair, so a master pair sitting on
+    # the pins the external master now drives has to move out of the way first.
+    if master_bck is not None:
+        print(f"\nMoving the master clock pair to BCK=GPIO{master_bck} "
+              f"LRCLK=GPIO{master_bck + 1}...")
+        rc = d.set_as_read(REQ_SET_I2S_BCK_PIN, (0 << 8) | master_bck)
+        print(f"  result: {status_name(rc)}")
+        ok &= rc == 0x00
+        if rc == 0x00:
+            current_master = master_bck
+
+    if pairs_overlap(current_master, slave_bck):
+        print(f"\n  ! The master pair (BCK=GPIO{current_master} "
+              f"LRCLK=GPIO{current_master + 1}) overlaps the requested")
+        print(f"    slave pair (BCK=GPIO{slave_bck} LRCLK=GPIO{slave_bck + 1}).")
+        print("    The firmware keeps the two pairs distinct, so this would be rejected")
+        print(f"    with PIN_IN_USE. Move the master pair too -- --master-bck "
+              f"{FALLBACK_MASTER_BCK} -- and re-run.")
+        return False
 
     # Order matters. Put the slave pair somewhere safe and switch to split pins
     # before selecting slave clocking, so the device never briefly listens on
@@ -240,7 +281,16 @@ def main() -> int:
         "--slave-bck",
         type=int,
         default=DEFAULT_SLAVE_BCK,
-        help=f"slave-pair BCK GPIO, LRCLK is this + 1 (default {DEFAULT_SLAVE_BCK})",
+        help="slave-pair BCK GPIO, LRCLK is this + 1: the pins the external master "
+        f"drives and a downstream I2S DAC shares (default {DEFAULT_SLAVE_BCK})",
+    )
+    ap.add_argument(
+        "--master-bck",
+        type=int,
+        default=None,
+        help="also move the master-pair BCK GPIO, LRCLK is this + 1 (default: leave it "
+        "alone). Needed only when the master pair overlaps the slave pair; "
+        f"{FALLBACK_MASTER_BCK} is the firmware default",
     )
     args = ap.parse_args()
 
@@ -257,10 +307,11 @@ def main() -> int:
 
     ok = apply_uart(d, args.tx, args.rx, args.baud)
     if args.audio:
-        ok &= apply_audio(d, args.slave_bck, args.persist)
-    elif args.persist:
-        print("\nNote: --persist only affects the audio settings, so it does nothing without --audio.")
-        print("The UART interface config is stored by the firmware as soon as it is applied.")
+        ok &= apply_audio(d, args.slave_bck, args.master_bck, before["master_bck"], args.persist)
+    elif args.persist or args.master_bck is not None:
+        print("\nNote: --persist, --slave-bck and --master-bck only affect the audio settings,")
+        print("so they do nothing without --audio. The UART interface config is stored by")
+        print("the firmware as soon as it is applied.")
 
     # Input-source and clock-mode changes are applied from the device's main
     # loop, not in the control handler, so a readback taken immediately still
