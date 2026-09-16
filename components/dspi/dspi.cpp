@@ -68,6 +68,10 @@ void DSPiHub::loop() {
     enqueue_get_(REQ_GET_USER_VOLUME, 4, &DSPiHub::on_user_volume_);
     enqueue_get_(REQ_GET_USER_MUTE, 1, &DSPiHub::on_user_mute_);
     enqueue_get_(REQ_GET_INPUT_SOURCE, 1, &DSPiHub::on_input_source_);
+    // One byte, and the only way a preset loaded elsewhere -- DSPi Console, a
+    // control surface -- becomes visible here.  The 32-byte name read it may
+    // trigger is conditional on the slot having actually changed.
+    enqueue_get_(REQ_PRESET_GET_ACTIVE, 1, &DSPiHub::on_preset_active_);
   }
 
   // Polling is the fallback for a device whose notifications are switched off.
@@ -77,6 +81,11 @@ void DSPiHub::loop() {
     last_poll_at_ = now;
     request_refresh();
   }
+
+  // Confirming a deferred preset load.  Ahead of the spectrum so a pending
+  // confirmation is not starved by band polls, and cheap: it enqueues nothing
+  // at all unless a load is actually awaiting confirmation.
+  service_preset_confirm_(now);
 
   // Spectrum polling, last of the producers so the debounced refresh above and
   // any user command already queued keep precedence within this same pass.  It
@@ -110,6 +119,24 @@ void DSPiHub::dump_config() {
     ESP_LOGCONFIG(TAG, "  Selectable input sources: %s", selectable_sources_string_().c_str());
   } else {
     ESP_LOGCONFIG(TAG, "  Selectable input sources: not yet known");
+  }
+  if (state_.active_preset_valid) {
+    ESP_LOGCONFIG(TAG, "  Active preset: slot %u \"%s\"", state_.active_preset,
+                  state_.active_preset_name_valid ? state_.active_preset_name.c_str() : "?");
+  }
+  if (state_.preset_dir_valid) {
+    // Which slots hold saved settings. Loading an unlisted one is allowed and
+    // simply applies factory defaults, so this is information rather than a
+    // constraint. `tools/dspi_setup.py` prints the names over USB.
+    std::string occupied;
+    for (uint8_t slot = 0; slot < PRESET_SLOTS; slot++) {
+      if ((state_.slot_occupied >> slot) & 1u) {
+        if (!occupied.empty())
+          occupied += ", ";
+        occupied += std::to_string(static_cast<unsigned>(slot));
+      }
+    }
+    ESP_LOGCONFIG(TAG, "  Saved preset slots: %s", occupied.empty() ? "none" : occupied.c_str());
   }
   if (rta_configured_) {
     ESP_LOGCONFIG(TAG, "  Spectrum analyser:");
@@ -486,6 +513,18 @@ void DSPiHub::on_platform_(const uint8_t *data, uint16_t len) {
                /*priority=*/0);
   enqueue_get_(REQ_GET_ADAT_INPUT_ENABLE, 1, &DSPiHub::on_adat_enable_, /*priority=*/0);
   enqueue_get_(REQ_GET_ADAT_INPUT_PIN, 1, &DSPiHub::on_adat_pin_, /*priority=*/0);
+  // Preset occupancy, for reporting only.  The ten slot names are deliberately
+  // not read here: dump_config runs long before this answers, so it could not
+  // print them anyway, and nothing else needs a name for a slot the device is
+  // not on.  `tools/dspi_setup.py` lists them over USB instead.
+  enqueue_get_(REQ_PRESET_GET_DIR, PRESET_DIR_LEN, &DSPiHub::on_preset_dir_, /*priority=*/0);
+
+  // Any preset load we were waiting on belongs to the device we were talking
+  // to before, which may not be this one.  Drop it rather than confirming a
+  // request the new device never received.
+  preset_confirm_pending_ = false;
+  preset_name_requested_ = false;
+  state_.active_preset_name_valid = false;
 
   // A device we have just identified may be a different one, or the same one
   // running new firmware, so anything we concluded about its RTA support is
@@ -665,6 +704,159 @@ void DSPiHub::publish_state_() {
   for (auto *l : listeners_) {
     l->on_dspi_state(state_);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Presets
+// ---------------------------------------------------------------------------
+//
+// A preset is the whole DSP state, so loading one can move master volume, the
+// input source and the output configuration as well.  Nothing here has to
+// handle that: the device emits BULK_INVALIDATED at the end of a load, which
+// already drives a full refresh of everything this component publishes.
+
+void DSPiHub::on_preset_dir_(const uint8_t *data, uint16_t len) {
+  PresetDirectory dir;
+  if (!parse_preset_directory(data, len, &dir)) {
+    ESP_LOGW(TAG, "Short preset directory response (%u bytes)", len);
+    return;
+  }
+  state_.slot_occupied = dir.slot_occupied;
+  state_.preset_dir_valid = true;
+  // last_active_slot is the same field REQ_PRESET_GET_ACTIVE returns, so the
+  // directory read doubles as a first active-slot reading.
+  on_preset_active_(&dir.last_active_slot, 1);
+}
+
+void DSPiHub::on_preset_active_(const uint8_t *data, uint16_t len) {
+  if (len < 1)
+    return;
+  const uint8_t slot = data[0];
+  if (slot >= PRESET_SLOTS) {
+    ESP_LOGW(TAG, "DSPi reported active preset slot %u, which is out of range", slot);
+    return;
+  }
+
+  const bool changed = !state_.active_preset_valid || state_.active_preset != slot;
+  state_.active_preset = slot;
+  state_.active_preset_valid = true;
+
+  if (preset_confirm_pending_ && slot == preset_confirm_slot_) {
+    ESP_LOGD(TAG, "Preset slot %u confirmed active", slot);
+    preset_confirm_pending_ = false;
+  }
+
+  // The name is a 32-byte read, so it is worth doing only when the slot has
+  // actually moved.  Re-request on a change even if one is already in flight:
+  // enqueue_() coalesces on opcode and wValue, so a stale request for the
+  // previous slot is replaced rather than both being sent.
+  if (changed || !state_.active_preset_name_valid) {
+    request_preset_name_(slot);
+  }
+  publish_state_();
+}
+
+void DSPiHub::request_preset_name_(uint8_t slot) {
+  preset_name_slot_ = slot;
+  preset_name_requested_ = true;
+  enqueue_get_(REQ_PRESET_GET_NAME, PRESET_NAME_LEN, &DSPiHub::on_preset_name_, /*priority=*/1,
+               /*wvalue=*/slot);
+}
+
+void DSPiHub::on_preset_name_(const uint8_t *data, uint16_t len) {
+  if (len < 1) {
+    ESP_LOGW(TAG, "Short preset name response (%u bytes)", len);
+    return;
+  }
+  // The reply carries no slot number, so it is attributed to the slot the
+  // outstanding request named.  If the active slot moved again while this was
+  // in flight, drop it and let the newer request answer instead.
+  if (!preset_name_requested_ || preset_name_slot_ != state_.active_preset)
+    return;
+
+  preset_name_requested_ = false;
+  state_.active_preset_name.assign(reinterpret_cast<const char *>(data), preset_name_length(data, len));
+  state_.active_preset_name_valid = true;
+  publish_state_();
+}
+
+void DSPiHub::set_preset_slot(uint8_t slot) {
+  if (slot >= PRESET_SLOTS) {
+    ESP_LOGE(TAG, "Preset slot %u is out of range (0..%u)", slot, PRESET_SLOTS - 1);
+    return;
+  }
+  if (state_.preset_dir_valid && !((state_.slot_occupied >> slot) & 1u)) {
+    // Sent anyway: an empty slot is a legitimate thing to load, it just means
+    // factory defaults rather than stored settings. Worth saying out loud,
+    // because the audible result is not what "load a preset" suggests.
+    ESP_LOGW(TAG, "Preset slot %u has never been saved; loading it applies factory defaults", slot);
+  }
+
+  Transaction t;
+  t.req = REQ_PRESET_LOAD;
+  // A GET frame even though this rewrites every DSP parameter: the firmware
+  // dispatches it under vendor_handle_get() with the slot in wValue. Sending
+  // it as a SET stalls.
+  t.frame_type = FRAME_GET_REQ;
+  t.wvalue = slot;
+  t.wlen = 1;
+  t.priority = 0;
+  // The load writes flash and resets the pipeline, so it gets the same longer
+  // budget as an input-source switch.
+  t.timeout_ms = flash_timeout_ms_;
+  t.on_ok = &DSPiHub::on_preset_load_;
+  t.on_fail = &DSPiHub::on_preset_load_failed_;
+  if (!enqueue_(t))
+    return;
+
+  preset_confirm_pending_ = true;
+  preset_confirm_slot_ = slot;
+  preset_confirm_attempts_ = 0;
+  preset_confirm_due_ = millis() + PRESET_CONFIRM_SETTLE_MS;
+}
+
+void DSPiHub::on_preset_load_(const uint8_t *data, uint16_t len) {
+  // A PRESET_* code, not a CtrlStatus: the transport already said OK to get
+  // here, and this byte is the preset layer's own verdict on the request.
+  const uint8_t status = len >= 1 ? data[0] : static_cast<uint8_t>(PRESET_OK);
+  if (status != PRESET_OK) {
+    ESP_LOGE(TAG, "DSPi rejected preset load of slot %u: %s", preset_confirm_slot_,
+             preset_status_to_string(status));
+    preset_confirm_pending_ = false;
+    // Republish so the entity springs back to whatever the device is really
+    // on, rather than sitting on a slot that was refused.
+    publish_state_();
+    return;
+  }
+  // Accepted, not applied: the firmware only set a pending flag. The real work
+  // happens in its main loop, and service_preset_confirm_() watches for it.
+  ESP_LOGD(TAG, "Preset load of slot %u accepted; awaiting confirmation", preset_confirm_slot_);
+}
+
+void DSPiHub::on_preset_load_failed_(uint8_t status) {
+  ESP_LOGW(TAG, "Preset load of slot %u failed: %s", preset_confirm_slot_, ctrl_status_to_string(status));
+  // Clearing this matters: without it a permanent failure would leave the
+  // confirmation poll running against a load the device never started.
+  preset_confirm_pending_ = false;
+  publish_state_();
+}
+
+void DSPiHub::service_preset_confirm_(uint32_t now) {
+  if (!preset_confirm_pending_)
+    return;
+  if ((now - preset_confirm_due_) >= 0x80000000UL)  // wrap-safe "now < due"
+    return;
+
+  if (++preset_confirm_attempts_ > PRESET_CONFIRM_ATTEMPTS) {
+    ESP_LOGW(TAG, "Preset slot %u never became active; leaving the entity on what the device reports",
+             preset_confirm_slot_);
+    preset_confirm_pending_ = false;
+    publish_state_();
+    return;
+  }
+
+  preset_confirm_due_ = now + PRESET_CONFIRM_SETTLE_MS;
+  enqueue_get_(REQ_PRESET_GET_ACTIVE, 1, &DSPiHub::on_preset_active_, /*priority=*/0);
 }
 
 // ---------------------------------------------------------------------------

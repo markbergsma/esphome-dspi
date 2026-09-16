@@ -72,6 +72,11 @@ REQ_GET_UART_CONFIG = 0xF6
 REQ_GET_CTRL_IFACE_STATUS = 0xF9
 REQ_SET_I2S_CLOCK_PIN_MODE = 0xFE  # IN  (write-as-read), wValue = 0/1
 REQ_GET_I2S_CLOCK_PIN_MODE = 0xFF
+REQ_PRESET_GET_NAME = 0x93  # wValue = slot, 32-byte NUL-padded name
+REQ_PRESET_GET_DIR = 0x95  # 7-byte directory summary
+
+PRESET_SLOTS = 10
+PRESET_NAME_LEN = 32
 
 INPUT_SOURCE_I2S = 2
 I2S_CLOCK_MODE_SLAVE = 1
@@ -128,6 +133,35 @@ def pairs_overlap(a: int, b: int) -> bool:
     return abs(a - b) <= 1
 
 
+def show_presets(d: DSPi) -> None:
+    """List the ten preset slots, so their names can be copied into YAML.
+
+    This lives here rather than in the ESPHome component's dump_config because
+    dump_config runs immediately after setup(), long before the component's
+    asynchronous probe has an answer -- it would print nothing useful. Reading
+    over USB also works when the UART link is the thing being set up.
+    """
+    dir_bytes = d.get(REQ_PRESET_GET_DIR, 7)
+    occupied = dir_bytes[0] | (dir_bytes[1] << 8)
+    startup_mode, default_slot, last_active = dir_bytes[2], dir_bytes[3], dir_bytes[4]
+
+    print("\nPresets:")
+    if startup_mode:
+        print("  startup:       whichever slot was last active")
+    else:
+        print(f"  startup:       slot {default_slot}")
+    print(f"  active:        slot {last_active}")
+    for slot in range(PRESET_SLOTS):
+        raw = d.get(REQ_PRESET_GET_NAME, PRESET_NAME_LEN, wvalue=slot)
+        name = raw.split(b"\0", 1)[0].decode("ascii", "replace")
+        # A slot can hold no saved data and still be loaded: doing so applies
+        # factory defaults. Worth distinguishing, since a preset select that
+        # offers an empty slot is offering a reset.
+        state = "saved" if (occupied >> slot) & 1 else "empty"
+        marker = " <- active" if slot == last_active else ""
+        print(f"    {slot}  {state:<5}  {name!r}{marker}")
+
+
 def show(d: DSPi) -> dict:
     """Print what the device currently reports, and return the parsed state."""
     plat = d.get(REQ_GET_PLATFORM, 7)
@@ -163,6 +197,8 @@ def show(d: DSPi) -> dict:
     print(f"  clock pin mode:  {'split' if pin_mode else 'unified'}")
     print(f"  master pair:     BCK=GPIO{master_bck}  LRCLK=GPIO{master_bck + 1}")
     print(f"  slave pair:      BCK=GPIO{slave_bck}  LRCLK=GPIO{slave_bck + 1}")
+
+    show_presets(d)
 
     return {
         "uart_enabled": bool(enabled),

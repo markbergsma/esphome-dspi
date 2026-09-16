@@ -154,6 +154,21 @@ enum Opcode : uint8_t {
   REQ_GET_ADAT_INPUT_ENABLE = 0x69,   // GET  -> uint8 0/1
   REQ_GET_ADAT_INPUT_PIN = 0x6B,      // GET  -> uint8 GPIO (0xFF = unset)
   REQ_GET_PLATFORM = 0x7F,            // GET  -> up to 7 bytes, truncatable
+
+  // Presets.  REQ_PRESET_LOAD is one of the write-as-read commands described
+  // above: it is dispatched under the firmware's vendor_handle_get() with the
+  // slot packed into wValue, so it must be sent as a GET frame even though it
+  // mutates the entire DSP state.  Sending it as a SET stalls.
+  //
+  // The load is also deferred: the firmware sets a pending flag and performs
+  // the work later in its main loop behind pipeline_reset_ready(), so the
+  // returned byte means "accepted", not "applied".  Confirm with
+  // REQ_PRESET_GET_ACTIVE rather than trusting it.
+  REQ_PRESET_LOAD = 0x91,        // GET  wValue = slot -> 1 status byte (PRESET_*)
+                                 //      (write-as-read, see above)
+  REQ_PRESET_GET_NAME = 0x93,    // GET  wValue = slot -> 32 bytes, NUL-padded
+  REQ_PRESET_GET_DIR = 0x95,     // GET  -> 7-byte PresetDirectory
+  REQ_PRESET_GET_ACTIVE = 0x9A,  // GET  -> uint8 active slot 0..9
   REQ_SET_MASTER_VOLUME = 0xD2,       // SET  <- float32 dB
   REQ_GET_MASTER_VOLUME = 0xD3,       // GET  -> float32 dB
   REQ_SET_USER_VOLUME = 0xDA,         // SET  <- float32 dB
@@ -228,6 +243,107 @@ enum InputSource : uint8_t {
 // Number of S/PDIF inputs the firmware defines. Index 0 is INPUT_SOURCE_SPDIF
 // and is always enabled; indices 1..3 map to SPDIF2..SPDIF4 and are optional.
 static constexpr uint8_t SPDIF_RX_NUM_INPUTS = 4;
+
+// ---------------------------------------------------------------------------
+// Presets
+// ---------------------------------------------------------------------------
+//
+// A preset slot holds a complete DSP state: EQ, crossovers, delays, the matrix,
+// output configuration, channel names, and -- when the device's master-volume
+// mode is 1 -- master volume too.  A preset is always active; there is no "no
+// preset" state, and loading an unoccupied slot applies factory defaults rather
+// than failing.
+//
+// Names live in the directory sector and exist for every slot regardless of
+// occupancy.  On a fresh device slot 0 is named "Default" and slots 1..9 are
+// empty strings.
+
+// PRESET_SLOTS and PRESET_NAME_LEN in the firmware's config.h.
+static constexpr uint8_t PRESET_SLOTS = 10;
+static constexpr uint8_t PRESET_NAME_LEN = 32;
+
+// Payload status codes returned by the preset commands.
+//
+// These are NOT CtrlStatus values.  They occupy their own numbering, which
+// agrees with CtrlStatus only on 0x00 meaning OK, and every other value
+// collides with an unrelated transport meaning.
+//
+// Two of those collisions are actively dangerous, which is why this is a
+// separate enum rather than a set of loose constants:
+//
+//   PRESET_ERR_INVALID_SLOT  0x01  ==  CTRL_STATUS_BUSY        (retryable)
+//   PRESET_ERR_FLASH_WRITE   0x04  ==  CTRL_STATUS_BULK_LOCKED (retryable)
+//
+// Passing one of these to ctrl_status_is_retryable() therefore does not merely
+// mislabel it, it turns a permanent rejection into an infinite retry loop.
+// None of these codes is ever retryable: the transport already succeeded by
+// the time one is read, and the answer will not change on a second attempt.
+// test_framing.cpp pins the collisions so this cannot rot silently.
+enum PresetStatus : uint8_t {
+  PRESET_OK = 0x00,
+  PRESET_ERR_INVALID_SLOT = 0x01,
+  PRESET_ERR_SLOT_EMPTY = 0x02,
+  PRESET_ERR_CRC = 0x03,
+  PRESET_ERR_FLASH_WRITE = 0x04,
+};
+
+inline const char *preset_status_to_string(uint8_t status) {
+  switch (status) {
+    case PRESET_OK:
+      return "OK";
+    case PRESET_ERR_INVALID_SLOT:
+      return "INVALID_SLOT";
+    case PRESET_ERR_SLOT_EMPTY:
+      return "SLOT_EMPTY";
+    case PRESET_ERR_CRC:
+      return "CRC";
+    case PRESET_ERR_FLASH_WRITE:
+      return "FLASH_WRITE";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+// REQ_PRESET_GET_DIR (0x95) response, 7 bytes.
+struct PresetDirectory {
+  uint16_t slot_occupied{0};  // bit N set = slot N holds user data
+  uint8_t startup_mode{0};    // 0 = load default_slot, 1 = load last_active
+  uint8_t default_slot{0};
+  uint8_t last_active_slot{0};
+  uint8_t output_config_mode{0};  // 0 = device-global, 1 = travels with preset
+  uint8_t master_volume_mode{0};  // 0 = device-global, 1 = travels with preset
+
+  bool is_occupied(uint8_t slot) const {
+    return slot < PRESET_SLOTS && (slot_occupied & (1u << slot)) != 0;
+  }
+};
+
+static constexpr uint16_t PRESET_DIR_LEN = 7;
+
+inline bool parse_preset_directory(const uint8_t *data, uint16_t len, PresetDirectory *out) {
+  if (len < PRESET_DIR_LEN)
+    return false;
+  out->slot_occupied = static_cast<uint16_t>(data[0] | (data[1] << 8));
+  out->startup_mode = data[2];
+  out->default_slot = data[3];
+  out->last_active_slot = data[4];
+  out->output_config_mode = data[5];
+  out->master_volume_mode = data[6];
+  return true;
+}
+
+// Length of a 32-byte NUL-padded device name.
+//
+// The firmware guarantees termination when a name is set through its own API,
+// but a full 32 characters leaves no room for the NUL, so the length is capped
+// at the field width rather than trusting a terminator to be there.
+inline uint8_t preset_name_length(const uint8_t *data, uint16_t len) {
+  const uint16_t limit = len < PRESET_NAME_LEN ? len : PRESET_NAME_LEN;
+  uint16_t n = 0;
+  while (n < limit && data[n] != 0)
+    n++;
+  return static_cast<uint8_t>(n);
+}
 
 // ---------------------------------------------------------------------------
 // Spectrum analyser (RTA)

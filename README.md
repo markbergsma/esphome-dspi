@@ -18,6 +18,7 @@ Currently only basic functionality is supported:
 - User & master volume (in dB)
 - Mute (all outputs)
 - Input source select
+- Preset select
 - Spectrum analyser (RTA) band data, for driving a display — see [docs/spectrum-analyzer.md](docs/spectrum-analyzer.md)
 
 ## Quick start
@@ -121,7 +122,15 @@ switch:
 select:
   - platform: dspi
     dspi_id: dspi_hub
+    type: input_source
     name: Input Source
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: preset            # one entity for the whole DSP configuration
+    name: Preset
+    slots:
+      0: Default
+      1: Movie
 ```
 
 
@@ -171,7 +180,12 @@ is inaudible; the firmware range is still enforced underneath, so a lambda can
 use the whole span. For user volume −60 *is* the firmware's own clamp, and a
 `min_value` below it is rejected at config time rather than silently ignored.
 
-### `select` — input source
+### `select` — input source and presets
+
+The `select` platform serves two unrelated controls, so **`type:` is required**:
+`input_source` or `preset`. As with `number`, the platform will not guess.
+
+### `select` — `type: input_source`
 
 **The DSPi runs exactly one input source at a time.**  So this is a source selector
 — closer to the source button on an AV receiver than to a mixer input. The DSPi's
@@ -202,6 +216,7 @@ offer options that do nothing.
 select:
   - platform: dspi
     dspi_id: dspi_hub
+    type: input_source
     name: Input Source
     sources: [i2s, spdif, spdif2]
     spdif2: "Optical Rear"      # relabel any source freely
@@ -218,6 +233,46 @@ the result in `dump_config`:
 [C][dspi]:   Selectable input sources: USB, S/PDIF, I2S
 ```
 
+### `select` — `type: preset`
+
+A DSPi preset is the **complete DSP state** — EQ, crossovers, delays, the
+matrix, the output setup — so this one entity reconfigures the whole processor.
+
+```yaml
+select:
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: preset
+    name: Preset
+    slots:
+      0: Default
+      1: Movie
+      3: Night
+```
+
+`slots:` is required and maps slot number to label. The labels are yours, not
+the device's: ESPHome fixes a select's options at startup, so a name read over
+UART could not be kept current. The device's own name for the active slot is
+published by the `preset_name` text sensor instead.
+
+Only loading is exposed; saving and deleting write flash and are left to DSPi
+Console. Loading a slot that has never been saved applies factory defaults.
+Full detail in [docs/presets.md](docs/presets.md).
+
+### `text_sensor`
+
+| `type` | Publishes |
+|---|---|
+| `preset_name` | The DSPi's own name for the slot it is currently on, or `Slot N` if that slot has never been named. |
+
+```yaml
+text_sensor:
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: preset_name
+    name: Preset Name
+```
+
 
 ## Using it without any entities
 
@@ -231,6 +286,7 @@ device that configures no `number`, `switch` or `select` at all:
         id(dspi_hub).set_master_volume_db(-6.0f);    // the ceiling
         id(dspi_hub).set_user_mute(true);
         id(dspi_hub).set_input_source(2);   // I2S
+        id(dspi_hub).set_preset_slot(1);    // load preset slot 1
 ```
 
 This is the basis for adding a rotary encoder or a display later. Note that the

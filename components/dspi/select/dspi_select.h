@@ -84,5 +84,67 @@ class DSPiInputSourceSelect : public select::Select, public Component, public DS
   bool has_published_{false};
 };
 
+// Preset slot.
+//
+// A DSPi preset is the complete DSP state -- EQ, crossovers, delays, the
+// matrix, output configuration -- so this one entity reconfigures the whole
+// processor.
+//
+// The option labels come from YAML rather than from the device, even though
+// the device stores a name per slot. ESPHome sends a select's options to Home
+// Assistant once, in the entity-list message at connect, and SelectTraits is
+// documented as "set once at startup"; a name read asynchronously over UART
+// arrives after that and would go stale again on every rename. The device's
+// own name for the active slot is published by the preset_name text_sensor
+// instead, where it can be updated honestly.
+class DSPiPresetSelect : public select::Select, public Component, public DSPiStateListener {
+ public:
+  void set_parent(DSPiHub *parent) { parent_ = parent; }
+  // Slot numbers in the same order as the configured options. As with the
+  // input source, the option index is deliberately not the wire value: the
+  // configured set is sparse and its order is the user's.
+  void set_slot_values(std::vector<uint8_t> values) { slot_values_ = std::move(values); }
+  void dump_config() override;
+
+  void on_dspi_state(const DSPiState &state) override {
+    if (!state.active_preset_valid)
+      return;
+
+    const int idx = index_for_slot_(state.active_preset);
+    if (idx < 0) {
+      // The device is on a slot this select does not list, which is normal:
+      // presets can also be loaded from DSPi Console or a control surface.
+      // Publishing anything would misreport it, so leave the entity alone.
+      ESP_LOGD("dspi.select", "DSPi is on preset slot %u, which this select does not list", state.active_preset);
+      return;
+    }
+    if (!has_published_ || state.active_preset != last_published_) {
+      last_published_ = state.active_preset;
+      has_published_ = true;
+      this->publish_state(static_cast<size_t>(idx));
+    }
+  }
+
+ protected:
+  void control(size_t index) override {
+    if (index < slot_values_.size()) {
+      parent_->set_preset_slot(slot_values_[index]);
+    }
+  }
+
+  int index_for_slot_(uint8_t slot) const {
+    for (size_t i = 0; i < slot_values_.size(); i++) {
+      if (slot_values_[i] == slot)
+        return static_cast<int>(i);
+    }
+    return -1;
+  }
+
+  DSPiHub *parent_{nullptr};
+  std::vector<uint8_t> slot_values_;
+  uint8_t last_published_{0};
+  bool has_published_{false};
+};
+
 }  // namespace dspi
 }  // namespace esphome

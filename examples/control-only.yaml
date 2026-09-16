@@ -94,6 +94,32 @@ switch:
 select:
   - platform: dspi
     dspi_id: dspi_hub
+    type: input_source
     name: Input Source
     id: dspi_input_source
     entity_category: config
+
+  # One entity that switches the entire DSP configuration: a preset carries
+  # EQ, crossovers, delays, the matrix and the output setup.
+  #
+  # The labels are yours, not the device's. List only the slots you actually
+  # use -- loading a slot that has never been saved applies factory defaults.
+  # `python3 tools/dspi_setup.py` prints what each slot on your DSPi holds.
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: preset
+    name: Preset
+    id: dspi_preset
+    slots:
+      0: Default
+      1: Movie
+      2: Night
+
+text_sensor:
+  # The DSPi's own name for the active slot. Unlike the labels above it tracks
+  # the device, so a preset loaded from DSPi Console shows up here too.
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: preset_name
+    name: Preset Name
+    id: dspi_preset_name

@@ -90,6 +90,28 @@ switch:
 select:
   - platform: dspi
     dspi_id: dspi_hub
+    type: input_source
     name: Input Source
     id: dspi_input_source
     entity_category: config
+
+  # A sparse, out-of-order slot list with custom labels, so codegen is
+  # exercised on something other than the obvious 0,1,2 case.
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: preset
+    name: Preset
+    id: dspi_preset
+    slots:
+      3: Night
+      0: Default
+      7: Movie
+
+text_sensor:
+  # The device's own name for whichever slot is active, which is not
+  # necessarily one the select above lists.
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: preset_name
+    name: Preset Name
+    id: dspi_preset_name

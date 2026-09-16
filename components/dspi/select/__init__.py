@@ -1,16 +1,22 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import select
+from esphome.const import CONF_TYPE
 
 from .. import DSPI_COMPONENT_SCHEMA, INPUT_SOURCES, dspi_ns, register_dspi_child
 
 DEPENDENCIES = ["dspi"]
 
 CONF_SOURCES = "sources"
+CONF_SLOTS = "slots"
 
 DSPiInputSourceSelect = dspi_ns.class_(
     "DSPiInputSourceSelect", select.Select, cg.Component
 )
+DSPiPresetSelect = dspi_ns.class_("DSPiPresetSelect", select.Select, cg.Component)
+
+# PRESET_SLOTS in the firmware's config.h.
+PRESET_SLOTS = 10
 
 # Default labels. The key is the protocol's own source name; the value is only
 # what Home Assistant displays, so it is free to be prettier.
@@ -32,7 +38,7 @@ DEFAULT_LABELS = {
 DEFAULT_SOURCES = ["usb", "spdif", "i2s"]
 
 
-def _validate(config):
+def _validate_sources(config):
     seen = set()
     for key in config[CONF_SOURCES]:
         if key in seen:
@@ -44,7 +50,14 @@ def _validate(config):
     return config
 
 
-CONFIG_SCHEMA = cv.All(
+def _validate_slots(config):
+    labels = list(config[CONF_SLOTS].values())
+    if len(set(labels)) != len(labels):
+        raise cv.Invalid("preset labels must be unique")
+    return config
+
+
+INPUT_SOURCE_SCHEMA = (
     select.select_schema(DSPiInputSourceSelect)
     .extend(
         {
@@ -59,12 +72,60 @@ CONFIG_SCHEMA = cv.All(
         }
     )
     .extend(DSPI_COMPONENT_SCHEMA)
-    .extend(cv.COMPONENT_SCHEMA),
-    _validate,
+    .extend(cv.COMPONENT_SCHEMA)
+    .add_extra(_validate_sources)
+)
+
+# `slots:` is required rather than defaulting to all ten. A fresh DSPi names
+# only slot 0 and marks none occupied, so a generated list would be ten
+# indistinguishable entries -- and picking an unsaved one loads factory
+# defaults, which is a surprising thing to offer by accident. Listing the
+# presets actually in use is a one-time cost and makes the entity readable.
+#
+# Slot numbers are the mapping keys, so YAML order is the option order and a
+# sparse set (0, 1, 3) needs no extra syntax. `python3 tools/dspi_setup.py`
+# prints the device's own names to copy from.
+PRESET_SCHEMA = (
+    select.select_schema(DSPiPresetSelect)
+    .extend(
+        {
+            cv.Required(CONF_SLOTS): cv.All(
+                {cv.int_range(min=0, max=PRESET_SLOTS - 1): cv.string_strict},
+                cv.Length(min=1),
+            ),
+        }
+    )
+    .extend(DSPI_COMPONENT_SCHEMA)
+    .extend(cv.COMPONENT_SCHEMA)
+    .add_extra(_validate_slots)
+)
+
+# `type` is required, as it is on the number platform: one platform serving two
+# unrelated controls should say which it is at the point of use rather than by
+# omission.
+CONFIG_SCHEMA = cv.typed_schema(
+    {
+        "input_source": INPUT_SOURCE_SCHEMA,
+        "preset": PRESET_SCHEMA,
+    },
+    key=CONF_TYPE,
+    lower=True,
 )
 
 
 async def to_code(config):
+    if config[CONF_TYPE] == "preset":
+        # Parallel lists in configured order, as below: the index is not the
+        # slot number, since the set may be sparse.
+        slots = list(config[CONF_SLOTS].keys())
+        options = [config[CONF_SLOTS][slot] for slot in slots]
+
+        var = await select.new_select(config, options=options)
+        await cg.register_component(var, config)
+        cg.add(var.set_slot_values(slots))
+        await register_dspi_child(var, config)
+        return
+
     # Options and wire values are built as parallel lists in the configured
     # order. The index is deliberately NOT used as the wire value: the set is
     # sparse once the optional sources are involved, and the order is the user's.

@@ -400,6 +400,109 @@ static void test_rta_request_bytes() {
   check(n == 1 + 1 + REQ_HEADER_LEN + 2, "with no payload");
 }
 
+// ---------------------------------------------------------------------------
+// Presets
+// ---------------------------------------------------------------------------
+
+static void test_preset_directory_parse() {
+  std::printf("Preset directory\n");
+  check(PRESET_SLOTS == 10, "10 preset slots");
+  check(PRESET_NAME_LEN == 32, "names are 32 bytes");
+  check(PRESET_DIR_LEN == 7, "the directory is 7 bytes");
+
+  // Occupancy is a little-endian u16, so a slot above 7 lives in the second
+  // byte -- reading it as one byte would silently lose slots 8 and 9.
+  const auto raw = unhex("05 03 01 04 02 00 01");
+  PresetDirectory dir;
+  check(parse_preset_directory(raw.data(), raw.size(), &dir), "a 7-byte payload parses");
+  check(dir.slot_occupied == 0x0305, "occupancy is little-endian");
+  check(dir.is_occupied(0) && dir.is_occupied(2) && dir.is_occupied(8) && dir.is_occupied(9),
+        "slots 0, 2, 8 and 9 are occupied");
+  check(!dir.is_occupied(1) && !dir.is_occupied(7), "slots 1 and 7 are not");
+  check(!dir.is_occupied(PRESET_SLOTS), "an out-of-range slot is never occupied");
+  check(dir.startup_mode == 1 && dir.default_slot == 4, "startup mode and default slot");
+  check(dir.last_active_slot == 2, "last active slot");
+  check(dir.output_config_mode == 0 && dir.master_volume_mode == 1, "both persistence modes");
+
+  check(!parse_preset_directory(raw.data(), 6, &dir), "a short payload is rejected");
+}
+
+static void test_preset_name_parse() {
+  std::printf("Preset name\n");
+  std::vector<uint8_t> name(PRESET_NAME_LEN, 0);
+  std::memcpy(name.data(), "Movie", 5);
+  check(preset_name_length(name.data(), name.size()) == 5, "a NUL-padded name stops at the terminator");
+
+  // Every slot but 0 is an empty string on a fresh device, which is a real
+  // state to report rather than a parse failure.
+  std::vector<uint8_t> empty(PRESET_NAME_LEN, 0);
+  check(preset_name_length(empty.data(), empty.size()) == 0, "an unnamed slot reads as empty");
+
+  // 32 visible characters leave no room for a terminator, so the field width
+  // has to be the limit rather than the NUL.
+  std::vector<uint8_t> full(PRESET_NAME_LEN, 'x');
+  check(preset_name_length(full.data(), full.size()) == PRESET_NAME_LEN, "a full 32-byte name is not overrun");
+
+  // A truncated response must not be read past its actual length.
+  check(preset_name_length(full.data(), 4) == 4, "a short response is bounded by its own length");
+}
+
+static void test_preset_status_is_not_ctrl_status() {
+  std::printf("Preset status codes\n");
+  // PRESET_* codes live in byte 0 of a preset command's response payload, and
+  // they are a different namespace from the transport's CtrlStatus. The two
+  // agree only on 0x00 meaning OK, and every other value collides with an
+  // unrelated meaning.
+  //
+  // The casts are deliberate: -Wenum-compare refuses to compare the two enums
+  // directly, which is the compiler making the same point.
+  check(static_cast<uint8_t>(PRESET_OK) == 0x00, "PRESET_OK is 0x00");
+  check(static_cast<uint8_t>(PRESET_ERR_SLOT_EMPTY) == static_cast<uint8_t>(CTRL_STATUS_ERROR),
+        "SLOT_EMPTY collides with CTRL_STATUS_ERROR by value");
+
+  // This is the trap, asserted rather than described. Two of the four preset
+  // errors land on transport codes that are *retryable*, so feeding a preset
+  // status to the transport classifier does not merely mislabel it -- it turns
+  // a permanent rejection into an infinite retry loop. Both of these read
+  // "true", and both are wrong. Hence the separate enum, and hence
+  // on_preset_load_() reading the byte as a PresetStatus and never routing it
+  // through ctrl_status_is_retryable().
+  check(static_cast<uint8_t>(PRESET_ERR_INVALID_SLOT) == static_cast<uint8_t>(CTRL_STATUS_BUSY),
+        "INVALID_SLOT collides with the retryable BUSY");
+  check(static_cast<uint8_t>(PRESET_ERR_FLASH_WRITE) == static_cast<uint8_t>(CTRL_STATUS_BULK_LOCKED),
+        "FLASH_WRITE collides with the retryable BULK_LOCKED");
+  check(ctrl_status_is_retryable(PRESET_ERR_INVALID_SLOT),
+        "so the transport classifier would wrongly retry INVALID_SLOT");
+  check(ctrl_status_is_retryable(PRESET_ERR_FLASH_WRITE),
+        "and wrongly retry FLASH_WRITE -- never classify a preset status this way");
+
+  check(std::string(preset_status_to_string(PRESET_ERR_FLASH_WRITE)) == "FLASH_WRITE", "status names its code");
+  check(std::string(preset_status_to_string(PRESET_ERR_INVALID_SLOT)) == "INVALID_SLOT", "and the others");
+}
+
+static void test_preset_request_bytes() {
+  std::printf("Preset request framing\n");
+  uint8_t buf[MAX_TX_FRAME];
+
+  // The load rewrites every DSP parameter, yet the firmware dispatches it on
+  // its GET path with the slot in wValue. Sent as a SET frame it stalls, so
+  // the frame type is pinned here rather than inferred from "this is a write".
+  size_t n = build_request_frame(buf, FRAME_GET_REQ, REQ_PRESET_LOAD, /*wvalue=*/3, /*windex=*/0,
+                                 /*wlen=*/1, nullptr, 0);
+  check(buf[1] == FRAME_GET_REQ, "PRESET_LOAD is sent as a GET frame");
+  check(buf[2] == REQ_PRESET_LOAD && buf[3] == 3 && buf[4] == 0, "the slot rides in wValue");
+  check(buf[7] == 1 && buf[8] == 0, "one status byte is requested");
+  check(n == 1 + 1 + REQ_HEADER_LEN + 2, "with no payload");
+
+  // The name read is the one preset command with a payload worth sizing: 32
+  // bytes against a 132-byte transport cap.
+  n = build_request_frame(buf, FRAME_GET_REQ, REQ_PRESET_GET_NAME, /*wvalue=*/7, 0, PRESET_NAME_LEN, nullptr, 0);
+  check(buf[2] == REQ_PRESET_GET_NAME && buf[3] == 7, "GET_NAME carries the slot in wValue");
+  check(buf[7] == PRESET_NAME_LEN, "and asks for the full 32 bytes");
+  check(PRESET_NAME_LEN <= MAX_RX_PAYLOAD, "a name fits the transport");
+  (void) n;
+}
+
 int main() {
   test_crc_reference();
   test_spec_vectors();
@@ -414,6 +517,10 @@ int main() {
   test_rta_level_decode();
   test_rta_frame_over_transport();
   test_rta_request_bytes();
+  test_preset_directory_parse();
+  test_preset_name_parse();
+  test_preset_status_is_not_ctrl_status();
+  test_preset_request_bytes();
 
   if (failures) {
     std::printf("\n%d test(s) FAILED\n", failures);

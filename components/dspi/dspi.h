@@ -36,6 +36,20 @@ struct DSPiState {
   // the enum and is only knowable by asking. Valid once the probe has run.
   uint8_t selectable_mask{0};
   bool selectable_valid{false};
+  // The slot the device is actually on, which is not necessarily one this
+  // config lists: presets can also be loaded from DSPi Console or a control
+  // surface.
+  uint8_t active_preset{0};
+  bool active_preset_valid{false};
+  // The device's own name for active_preset, read from its directory. Empty
+  // when that slot has never been named. Distinct from the labels configured
+  // in YAML, which are the user's and are fixed at compile time.
+  std::string active_preset_name;
+  bool active_preset_name_valid{false};
+  // Bit N set = slot N holds user data. Read once at probe; only used for
+  // reporting, since a slot being empty does not stop it being loaded.
+  uint16_t slot_occupied{0};
+  bool preset_dir_valid{false};
 };
 
 // Implemented by the child entity platforms.  An abstract listener rather than
@@ -181,6 +195,10 @@ class DSPiHub : public Component, public uart::UARTDevice {
   void set_user_volume_db(float db);
   void set_user_mute(bool mute);
   void set_input_source(uint8_t source);
+  // Load a preset slot (0..9).  The device defers the work, so this returns
+  // long before the preset is live and nothing is published until a readback
+  // confirms the device actually moved.
+  void set_preset_slot(uint8_t slot);
   // Re-read everything we publish.  Debounced, so a burst of notifications
   // costs one round of reads rather than one per event.
   void request_refresh();
@@ -257,6 +275,17 @@ class DSPiHub : public Component, public uart::UARTDevice {
   void on_input_source_(const uint8_t *data, uint16_t len);
   void publish_state_();
 
+  // --- presets -------------------------------------------------------------
+  void on_preset_dir_(const uint8_t *data, uint16_t len);
+  void on_preset_active_(const uint8_t *data, uint16_t len);
+  void on_preset_name_(const uint8_t *data, uint16_t len);
+  void on_preset_load_(const uint8_t *data, uint16_t len);
+  void on_preset_load_failed_(uint8_t status);
+  // Re-reads the active slot until it matches what we asked for.  Called from
+  // loop(); does nothing unless a load is awaiting confirmation.
+  void service_preset_confirm_(uint32_t now);
+  void request_preset_name_(uint8_t slot);
+
   // --- RTA -----------------------------------------------------------------
   void service_rta_(uint32_t now);
   void reset_rta_();
@@ -298,6 +327,26 @@ class DSPiHub : public Component, public uart::UARTDevice {
 
   DSPiState state_{};
   std::vector<DSPiStateListener *> listeners_;
+
+  // --- preset state --------------------------------------------------------
+  //
+  // A load is deferred behind a flash write and a pipeline reset, so the
+  // accepted-status byte proves nothing.  These track the confirmation poll.
+  //
+  // The settle delay is not optional padding.  The firmware pushes
+  // PRESET_LOADED at the *start* of the load and only writes last_active_slot
+  // at the end, so a read issued the instant the command is accepted returns
+  // the slot we were on before.
+  static constexpr uint32_t PRESET_CONFIRM_SETTLE_MS = 250;
+  static constexpr uint8_t PRESET_CONFIRM_ATTEMPTS = 6;
+  bool preset_confirm_pending_{false};
+  uint8_t preset_confirm_slot_{0};
+  uint8_t preset_confirm_attempts_{0};
+  uint32_t preset_confirm_due_{0};
+  // Which slot's name we last asked for, so the 32-byte read happens on a
+  // change of active slot rather than on every refresh.
+  uint8_t preset_name_slot_{0};
+  bool preset_name_requested_{false};
 
   // --- RTA state -----------------------------------------------------------
   RtaPhase rta_phase_{RtaPhase::DISABLED};
