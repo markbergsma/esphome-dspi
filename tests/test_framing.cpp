@@ -503,6 +503,92 @@ static void test_preset_request_bytes() {
   (void) n;
 }
 
+// All five ToggleTarget values, so a new one added to the enum but forgotten
+// here shows up as a -Wswitch warning in the helpers rather than as a silently
+// untested row.
+static const ToggleTarget ALL_TOGGLES[] = {
+    ToggleTarget::USER_MUTE, ToggleTarget::LOUDNESS, ToggleTarget::EQ_BYPASS,
+    ToggleTarget::CROSSFEED, ToggleTarget::LEVELLER,
+};
+
+static void test_toggle_opcodes() {
+  std::printf("DSP toggle opcode table\n");
+
+  // Pinned against the firmware's config.h so a transcription slip is a test
+  // failure rather than a device that silently ignores a write.
+  check(toggle_set_opcode(ToggleTarget::USER_MUTE) == 0xDC, "user_mute SET is 0xDC");
+  check(toggle_get_opcode(ToggleTarget::USER_MUTE) == 0xDD, "user_mute GET is 0xDD");
+  check(toggle_set_opcode(ToggleTarget::LOUDNESS) == 0x58, "loudness SET is 0x58");
+  check(toggle_get_opcode(ToggleTarget::LOUDNESS) == 0x59, "loudness GET is 0x59");
+  check(toggle_set_opcode(ToggleTarget::EQ_BYPASS) == 0x46, "eq_bypass SET is 0x46");
+  check(toggle_get_opcode(ToggleTarget::EQ_BYPASS) == 0x47, "eq_bypass GET is 0x47");
+  check(toggle_set_opcode(ToggleTarget::CROSSFEED) == 0x5E, "crossfeed SET is 0x5E");
+  check(toggle_get_opcode(ToggleTarget::CROSSFEED) == 0x5F, "crossfeed GET is 0x5F");
+  check(toggle_set_opcode(ToggleTarget::LEVELLER) == 0xB4, "leveller SET is 0xB4");
+  check(toggle_get_opcode(ToggleTarget::LEVELLER) == 0xB5, "leveller GET is 0xB5");
+
+  const size_t count = sizeof(ALL_TOGGLES) / sizeof(ALL_TOGGLES[0]);
+  check(count == TOGGLE_COUNT, "TOGGLE_COUNT matches the enum");
+
+  // Every opcode in the family must be distinct, in both directions at once:
+  // two targets sharing a SET opcode would coalesce in the hub's queue and lose
+  // a write, and sharing a GET would route one target's readback into another.
+  bool all_distinct = true;
+  bool all_named = true;
+  for (size_t i = 0; i < count; i++) {
+    if (std::string(toggle_name(ALL_TOGGLES[i])) == "unknown")
+      all_named = false;
+    for (size_t j = i + 1; j < count; j++) {
+      if (toggle_set_opcode(ALL_TOGGLES[i]) == toggle_set_opcode(ALL_TOGGLES[j]))
+        all_distinct = false;
+      if (toggle_get_opcode(ALL_TOGGLES[i]) == toggle_get_opcode(ALL_TOGGLES[j]))
+        all_distinct = false;
+    }
+    // A target whose SET and GET were the same opcode would read back what it
+    // had just written from the wrong path entirely.
+    if (toggle_set_opcode(ALL_TOGGLES[i]) == toggle_get_opcode(ALL_TOGGLES[i]))
+      all_distinct = false;
+  }
+  check(all_distinct, "every SET and GET opcode in the family is distinct");
+  check(all_named, "every target has a name for dump_config");
+
+  // Bits and their popcount, which the refresh burst sizes itself from.
+  check(toggle_bit(ToggleTarget::USER_MUTE) == 0x0001, "USER_MUTE is bit 0");
+  check(toggle_bit(ToggleTarget::LEVELLER) == 0x0010, "LEVELLER is bit 4");
+  check(toggle_mask_count(0) == 0, "an empty mask counts zero");
+  check(toggle_mask_count(0x001F) == 5, "a full mask counts every target");
+  check(toggle_mask_count(0x0005) == 2, "and a sparse one counts its bits");
+}
+
+static void test_toggle_request_bytes() {
+  std::printf("DSP toggle framing\n");
+  uint8_t buf[MAX_TX_FRAME];
+  uint8_t payload[1] = {1};
+
+  // Unlike REQ_PRESET_LOAD, these are ordinary SETs: their handlers sit above
+  // vendor_handle_get() in the firmware. Pinned byte for byte, because sending
+  // one on the wrong path is the single most likely way to get this wrong.
+  size_t n = build_request_frame(buf, FRAME_SET_REQ, toggle_set_opcode(ToggleTarget::LOUDNESS), /*wvalue=*/0,
+                                 /*windex=*/0, /*wlen=*/1, payload, 1);
+  check(hex(buf, n) == "A5 01 58 00 00 00 00 01 00 01 FE 01", "loudness SET request bytes");
+  check(buf[1] == FRAME_SET_REQ, "a toggle write is a SET frame, not write-as-read");
+  check(buf[3] == 0 && buf[4] == 0, "with nothing in wValue -- the value is a payload byte");
+
+  n = build_request_frame(buf, FRAME_GET_REQ, toggle_get_opcode(ToggleTarget::LOUDNESS), 0, 0, 1, nullptr, 0);
+  check(hex(buf, n) == "A5 02 59 00 00 00 00 01 00 F2 4C", "loudness GET request bytes");
+  check(n == 1 + 1 + REQ_HEADER_LEN + 2, "and no payload");
+
+  // Every target answers one byte, so the read length is uniform.
+  for (size_t i = 0; i < sizeof(ALL_TOGGLES) / sizeof(ALL_TOGGLES[0]); i++) {
+    n = build_request_frame(buf, FRAME_GET_REQ, toggle_get_opcode(ALL_TOGGLES[i]), 0, 0, 1, nullptr, 0);
+    if (buf[7] != 1 || buf[8] != 0) {
+      check(false, std::string("one byte requested for ") + toggle_name(ALL_TOGGLES[i]));
+      break;
+    }
+  }
+  check(true, "one byte requested for every target");
+}
+
 int main() {
   test_crc_reference();
   test_spec_vectors();
@@ -521,6 +607,8 @@ int main() {
   test_preset_name_parse();
   test_preset_status_is_not_ctrl_status();
   test_preset_request_bytes();
+  test_toggle_opcodes();
+  test_toggle_request_bytes();
 
   if (failures) {
     std::printf("\n%d test(s) FAILED\n", failures);

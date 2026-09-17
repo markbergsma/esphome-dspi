@@ -8,27 +8,34 @@
 namespace esphome {
 namespace dspi {
 
-// User mute.
+// One of the DSPi's boolean parameters: user mute, or a DSP feature toggle.
 //
-// As with the volume number, state is published on confirmation rather than
-// optimistically, so a mute toggled from elsewhere shows up here.
-class DSPiMuteSwitch : public switch_::Switch, public Component, public DSPiStateListener {
+// Which one is a ToggleTarget rather than a subclass, because they differ only
+// in the opcode pair the hub looks up. As with the volume number, state is
+// published on confirmation rather than optimistically, so a value changed from
+// elsewhere -- DSPi Console, a control surface, a preset load -- shows up here.
+class DSPiSwitch : public switch_::Switch, public Component, public DSPiStateListener {
  public:
   void set_parent(DSPiHub *parent) { parent_ = parent; }
+  void set_target(ToggleTarget target) { target_ = target; }
   void dump_config() override;
 
   void on_dspi_state(const DSPiState &state) override {
-    if (state.user_mute_valid && (!has_published_ || state.user_mute != last_published_)) {
-      last_published_ = state.user_mute;
+    if (!state.toggle_valid(target_))
+      return;
+    const bool value = state.toggle(target_);
+    if (!has_published_ || value != last_published_) {
+      last_published_ = value;
       has_published_ = true;
-      this->publish_state(state.user_mute);
+      this->publish_state(value);
     }
   }
 
  protected:
-  void write_state(bool value) override { parent_->set_user_mute(value); }
+  void write_state(bool value) override { parent_->set_toggle(target_, value); }
 
   DSPiHub *parent_{nullptr};
+  ToggleTarget target_{ToggleTarget::USER_MUTE};
   bool last_published_{false};
   bool has_published_{false};
 };

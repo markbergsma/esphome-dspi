@@ -19,6 +19,7 @@ Currently only basic functionality is supported:
 - Mute (all outputs)
 - Input source select
 - Preset select
+- DSP toggles: loudness, EQ bypass, crossfeed, leveller
 - Spectrum analyser (RTA) band data, for driving a display — see [docs/spectrum-analyzer.md](docs/spectrum-analyzer.md)
 
 ## Quick start
@@ -117,7 +118,12 @@ number:
 switch:
   - platform: dspi
     dspi_id: dspi_hub
+    type: user_mute          # all outputs
     name: Mute
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: loudness           # equal-loudness compensation
+    name: Loudness
 
 select:
   - platform: dspi
@@ -179,6 +185,37 @@ allows −127, but a slider spanning that is unusable since nearly all its trave
 is inaudible; the firmware range is still enforced underneath, so a lambda can
 use the whole span. For user volume −60 *is* the firmware's own clamp, and a
 `min_value` below it is rejected at config time rather than silently ignored.
+
+### `switch` — mute and the DSP toggles
+
+The `switch` platform carries the DSPi's boolean parameters, so **`type:` is
+required**. As with `number`, the platform will not guess.
+
+| `type` | What it does |
+|---|---|
+| `user_mute` | Mutes all outputs. The same parameter the USB host's mute drives. |
+| `loudness` | Equal-loudness compensation, keyed to the **user** volume. |
+| `eq_bypass` | Bypasses the master EQ — every PEQ band on every channel at once. |
+| `crossfeed` | Headphone crossfeed. |
+| `leveller` | The leveller: a channel-linked RMS compressor with a soft knee. |
+
+**None of these persist.** The DSPi keeps them in RAM and inside each preset, so
+a toggle lasts until the DSPi loses power or loads a preset, and then follows
+whatever that preset stored. Saving is not exposed, for the same reason preset
+saving is not — it would overwrite a stored preset. Note that reflashing *this*
+board is not a DSPi reboot: the two are powered separately, so the toggles come
+back reading what they were.
+
+Three device behaviours are worth knowing, since none of them is a bug:
+
+- **Loudness is keyed to the user volume**, so at 0 dB attenuation there is
+  nothing to boost and switching it on is inaudible until you turn down.
+- **Crossfeed only affects the output pairs in its own mask**, which defaults to
+  outputs 0/1. Set that mask in DSPi Console.
+- **`eq_bypass` is global** — every PEQ band on every channel, not one channel
+  and not the crossovers.
+
+A toggle you leave out of the config is not polled at all.
 
 ### `select` — input source and presets
 
@@ -287,7 +324,15 @@ device that configures no `number`, `switch` or `select` at all:
         id(dspi_hub).set_user_mute(true);
         id(dspi_hub).set_input_source(2);   // I2S
         id(dspi_hub).set_preset_slot(1);    // load preset slot 1
+        id(dspi_hub).set_loudness(true);    // and the DSP toggles
+        id(dspi_hub).set_eq_bypass(false);
+        id(dspi_hub).set_crossfeed(true);
+        id(dspi_hub).set_leveller(true);
 ```
+
+Setting a DSP toggle this way also starts reading it back, so
+`id(dspi_hub).state().toggle(ToggleTarget::LOUDNESS)` reports the device's real
+answer rather than staying unknown on a config with no switch entity.
 
 This is the basis for adding a rotary encoder or a display later. Note that the
 component never blocks in `loop()`, which is what makes that possible:

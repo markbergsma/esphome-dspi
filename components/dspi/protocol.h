@@ -151,6 +151,16 @@ enum Opcode : uint8_t {
   REQ_RTA_CONTROL = 0x0E,     // GET  wValue = RTA_CTL_* -> 1 status byte
                               //      (write-as-read, see above)
 
+  // DSP feature toggles.  Each is a plain 1-byte SET with a 1-byte GET and is
+  // dispatched on the ordinary SET path, unlike the write-as-read commands
+  // above.  See ToggleTarget below, which pairs them up.
+  REQ_SET_BYPASS = 0x46,              // SET  <- uint8 0/1 (master EQ bypass)
+  REQ_GET_BYPASS = 0x47,              // GET  -> uint8 0/1
+  REQ_SET_LOUDNESS = 0x58,            // SET  <- uint8 0/1
+  REQ_GET_LOUDNESS = 0x59,            // GET  -> uint8 0/1
+  REQ_SET_CROSSFEED = 0x5E,           // SET  <- uint8 0/1
+  REQ_GET_CROSSFEED = 0x5F,           // GET  -> uint8 0/1
+
   REQ_GET_ADAT_INPUT_ENABLE = 0x69,   // GET  -> uint8 0/1
   REQ_GET_ADAT_INPUT_PIN = 0x6B,      // GET  -> uint8 GPIO (0xFF = unset)
   REQ_GET_PLATFORM = 0x7F,            // GET  -> up to 7 bytes, truncatable
@@ -169,6 +179,8 @@ enum Opcode : uint8_t {
   REQ_PRESET_GET_NAME = 0x93,    // GET  wValue = slot -> 32 bytes, NUL-padded
   REQ_PRESET_GET_DIR = 0x95,     // GET  -> 7-byte PresetDirectory
   REQ_PRESET_GET_ACTIVE = 0x9A,  // GET  -> uint8 active slot 0..9
+  REQ_SET_LEVELLER_ENABLE = 0xB4,     // SET  <- uint8 0/1 (a DSP feature toggle)
+  REQ_GET_LEVELLER_ENABLE = 0xB5,     // GET  -> uint8 0/1
   REQ_SET_MASTER_VOLUME = 0xD2,       // SET  <- float32 dB
   REQ_GET_MASTER_VOLUME = 0xD3,       // GET  -> float32 dB
   REQ_SET_USER_VOLUME = 0xDA,         // SET  <- float32 dB
@@ -243,6 +255,117 @@ enum InputSource : uint8_t {
 // Number of S/PDIF inputs the firmware defines. Index 0 is INPUT_SOURCE_SPDIF
 // and is always enabled; indices 1..3 map to SPDIF2..SPDIF4 and are optional.
 static constexpr uint8_t SPDIF_RX_NUM_INPUTS = 4;
+
+// ---------------------------------------------------------------------------
+// Boolean DSP parameters
+// ---------------------------------------------------------------------------
+//
+// The DSPi exposes a family of plain on/off parameters, each with its own SET
+// and GET opcode carrying a single 0/1 byte. This enum names the ones this
+// component drives and pairs each with its opcodes, so a caller never has to
+// hold an opcode and a target at the same time.
+//
+// The REQ_* constants above carry the firmware's own spellings, and this enum
+// is where that stops: EQ_BYPASS and LEVELLER read better than the opcodes'
+// BYPASS and LEVELLER_ENABLE, and the mapping below is the one place the two
+// naming schemes have to meet. So this enum, toggle_name() and the YAML `type:`
+// key all agree with each other, and only the opcodes agree with config.h.
+//
+// Every one of these is an *ordinary* SET -- their handlers sit above
+// vendor_handle_get() in the firmware's vendor_commands.c, so the frame type is
+// FRAME_SET_REQ to write and FRAME_GET_REQ to read. That is worth stating in
+// this header precisely because it is not true of the whole protocol (see the
+// write-as-read warning above REQ_RTA_CONTROL). Anything added here must be
+// checked against the firmware rather than assumed to match its neighbours;
+// there is deliberately no frame-type column below, because a write-as-read
+// opcode does not belong in this family at all.
+//
+// None of them writes flash and none resets the audio pipeline, so they are
+// cheap to poll and cheap to set. They are, however, RAM-only and *per-preset*:
+// the firmware stores them in a preset slot and restores them on load, but a
+// SET alone does not persist, so a toggle lasts until the device reboots or
+// loads a preset.
+enum class ToggleTarget : uint8_t {
+  USER_MUTE,
+  LOUDNESS,
+  EQ_BYPASS,
+  CROSSFEED,
+  LEVELLER,
+};
+
+// Number of ToggleTarget values, for iterating the family.
+static constexpr uint8_t TOGGLE_COUNT = 5;
+
+// A switch rather than a lookup table: a table at namespace scope in a header
+// gets one copy per translation unit and can carry a silent hole, whereas a
+// missing enumerator here is a -Wswitch warning, and tests/run.sh compiles with
+// -Werror.
+inline constexpr uint8_t toggle_set_opcode(ToggleTarget t) {
+  switch (t) {
+    case ToggleTarget::USER_MUTE:
+      return REQ_SET_USER_MUTE;
+    case ToggleTarget::LOUDNESS:
+      return REQ_SET_LOUDNESS;
+    case ToggleTarget::EQ_BYPASS:
+      return REQ_SET_BYPASS;
+    case ToggleTarget::CROSSFEED:
+      return REQ_SET_CROSSFEED;
+    case ToggleTarget::LEVELLER:
+      return REQ_SET_LEVELLER_ENABLE;
+  }
+  return 0;
+}
+
+inline constexpr uint8_t toggle_get_opcode(ToggleTarget t) {
+  switch (t) {
+    case ToggleTarget::USER_MUTE:
+      return REQ_GET_USER_MUTE;
+    case ToggleTarget::LOUDNESS:
+      return REQ_GET_LOUDNESS;
+    case ToggleTarget::EQ_BYPASS:
+      return REQ_GET_BYPASS;
+    case ToggleTarget::CROSSFEED:
+      return REQ_GET_CROSSFEED;
+    case ToggleTarget::LEVELLER:
+      return REQ_GET_LEVELLER_ENABLE;
+  }
+  return 0;
+}
+
+// The name each target goes by in logs, dump_config and the YAML `type:` key,
+// so a warning about one names the thing a user would edit.
+inline const char *toggle_name(ToggleTarget t) {
+  switch (t) {
+    case ToggleTarget::USER_MUTE:
+      return "user_mute";
+    case ToggleTarget::LOUDNESS:
+      return "loudness";
+    case ToggleTarget::EQ_BYPASS:
+      return "eq_bypass";
+    case ToggleTarget::CROSSFEED:
+      return "crossfeed";
+    case ToggleTarget::LEVELLER:
+      return "leveller";
+  }
+  return "unknown";
+}
+
+// Bit for `target` in a toggle mask. The masks are uint16_t, so TOGGLE_COUNT
+// must stay under 16; the static_assert below is the reminder.
+inline constexpr uint16_t toggle_bit(ToggleTarget t) { return static_cast<uint16_t>(1u << static_cast<uint8_t>(t)); }
+
+static_assert(TOGGLE_COUNT <= 16, "toggle masks are uint16_t");
+
+// How many targets a toggle mask holds. std::popcount is C++20 and this file
+// compiles as C++17 under both the host tests and the ESP toolchain.
+inline uint8_t toggle_mask_count(uint16_t mask) {
+  uint8_t n = 0;
+  while (mask != 0) {
+    mask = static_cast<uint16_t>(mask & (mask - 1));
+    n++;
+  }
+  return n;
+}
 
 // ---------------------------------------------------------------------------
 // Presets

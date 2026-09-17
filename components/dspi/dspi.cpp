@@ -62,16 +62,34 @@ void DSPiHub::loop() {
 
   // A due refresh becomes real work only once the debounce window has passed,
   // so a burst of notifications collapses into one round of reads.
+  //
+  // The burst goes out whole or not at all.  Every read in it carries the same
+  // priority, so enqueue_() would answer a full queue by evicting a sibling
+  // read -- silently, and with nothing that would ever reissue it: the probe's
+  // refresh is one-shot, polling is off whenever notifications work, and the
+  // next notification only arrives if something else changes.  Waiting for room
+  // costs a few loop passes instead and cannot stall, because every queued
+  // transaction ends in a response, a permanent rejection or a timeout.
   if (refresh_pending_ && (now - refresh_due_at_) < 0x80000000UL) {
-    refresh_pending_ = false;
-    enqueue_get_(REQ_GET_MASTER_VOLUME, 4, &DSPiHub::on_master_volume_);
-    enqueue_get_(REQ_GET_USER_VOLUME, 4, &DSPiHub::on_user_volume_);
-    enqueue_get_(REQ_GET_USER_MUTE, 1, &DSPiHub::on_user_mute_);
-    enqueue_get_(REQ_GET_INPUT_SOURCE, 1, &DSPiHub::on_input_source_);
-    // One byte, and the only way a preset loaded elsewhere -- DSPi Console, a
-    // control surface -- becomes visible here.  The 32-byte name read it may
-    // trigger is conditional on the slot having actually changed.
-    enqueue_get_(REQ_PRESET_GET_ACTIVE, 1, &DSPiHub::on_preset_active_);
+    const uint16_t toggles = toggles_to_read_();
+    if (queue_free_() >= 4 + toggle_mask_count(toggles)) {
+      refresh_pending_ = false;
+      enqueue_get_(REQ_GET_MASTER_VOLUME, 4, &DSPiHub::on_master_volume_);
+      enqueue_get_(REQ_GET_USER_VOLUME, 4, &DSPiHub::on_user_volume_);
+      enqueue_get_(REQ_GET_INPUT_SOURCE, 1, &DSPiHub::on_input_source_);
+      // One byte, and the only way a preset loaded elsewhere -- DSPi Console, a
+      // control surface -- becomes visible here.  The 32-byte name read it may
+      // trigger is conditional on the slot having actually changed.
+      enqueue_get_(REQ_PRESET_GET_ACTIVE, 1, &DSPiHub::on_preset_active_);
+      // Mute, plus whichever DSP toggles this config exposes.  A preset load
+      // rewrites all of them, and the trailing BULK_INVALIDATED brings us back
+      // through here, so no separate handling is needed for that.
+      for (uint8_t i = 0; i < TOGGLE_COUNT; i++) {
+        const ToggleTarget target = static_cast<ToggleTarget>(i);
+        if ((toggles & toggle_bit(target)) != 0)
+          enqueue_toggle_read_(target);
+      }
+    }
   }
 
   // Polling is the fallback for a device whose notifications are switched off.
@@ -137,6 +155,23 @@ void DSPiHub::dump_config() {
       }
     }
     ESP_LOGCONFIG(TAG, "  Saved preset slots: %s", occupied.empty() ? "none" : occupied.c_str());
+  }
+  // Which booleans are being polled, so a missing switch entity is visible as a
+  // missing read rather than only as an entity that never moves.
+  std::string toggles;
+  std::string rejected;
+  for (uint8_t i = 0; i < TOGGLE_COUNT; i++) {
+    const ToggleTarget target = static_cast<ToggleTarget>(i);
+    if ((toggle_read_mask_ & toggle_bit(target)) == 0)
+      continue;
+    std::string &dest = (toggle_unsupported_ & toggle_bit(target)) != 0 ? rejected : toggles;
+    if (!dest.empty())
+      dest += ", ";
+    dest += toggle_name(target);
+  }
+  ESP_LOGCONFIG(TAG, "  DSP toggles read: %s", toggles.empty() ? "none" : toggles.c_str());
+  if (!rejected.empty()) {
+    ESP_LOGCONFIG(TAG, "  DSP toggles unsupported by this firmware: %s", rejected.c_str());
   }
   if (rta_configured_) {
     ESP_LOGCONFIG(TAG, "  Spectrum analyser:");
@@ -221,6 +256,15 @@ bool DSPiHub::enqueue_(const Transaction &txn) {
   return false;
 }
 
+uint8_t DSPiHub::queue_free_() const {
+  uint8_t n = 0;
+  for (const auto &slot : queue_) {
+    if (!slot.in_use)
+      n++;
+  }
+  return n;
+}
+
 int DSPiHub::find_next_() const {
   int best = -1;
   for (int i = 0; i < QUEUE_DEPTH; i++) {
@@ -234,7 +278,7 @@ int DSPiHub::find_next_() const {
 }
 
 void DSPiHub::enqueue_get_(uint8_t req, uint16_t wlen, void (DSPiHub::*cb)(const uint8_t *, uint16_t),
-                           uint8_t priority, uint16_t wvalue) {
+                           uint8_t priority, uint16_t wvalue, void (DSPiHub::*on_fail)(uint8_t)) {
   Transaction t;
   t.req = req;
   t.frame_type = FRAME_GET_REQ;
@@ -245,6 +289,9 @@ void DSPiHub::enqueue_get_(uint8_t req, uint16_t wlen, void (DSPiHub::*cb)(const
   t.priority = priority;
   t.timeout_ms = request_timeout_ms_;
   t.on_ok = cb;
+  // Optional, and only worth passing for a read whose failure we must remember:
+  // most reads are stateless and a dropped one is reissued by the next refresh.
+  t.on_fail = on_fail;
   enqueue_(t);
 }
 
@@ -526,6 +573,13 @@ void DSPiHub::on_platform_(const uint8_t *data, uint16_t len) {
   preset_name_requested_ = false;
   state_.active_preset_name_valid = false;
 
+  // Same reasoning for the boolean DSP parameters: a device we have not read
+  // since identifying it may be a different one, so both the values and any
+  // verdict of "this firmware does not have that parameter" are stale.  The
+  // refresh at the end of this function is what fills them in again.
+  state_.toggle_valid_mask = 0;
+  toggle_unsupported_ = 0;
+
   // A device we have just identified may be a different one, or the same one
   // running new firmware, so anything we concluded about its RTA support is
   // now stale -- including a previous verdict of "unsupported".  Nothing is
@@ -672,12 +726,80 @@ void DSPiHub::on_user_volume_(const uint8_t *data, uint16_t len) {
   publish_state_();
 }
 
-void DSPiHub::on_user_mute_(const uint8_t *data, uint16_t len) {
+void DSPiHub::store_toggle_(ToggleTarget target, const uint8_t *data, uint16_t len) {
   if (len < 1)
     return;
-  state_.user_mute = data[0] != 0;
-  state_.user_mute_valid = true;
+  const uint16_t bit = toggle_bit(target);
+  if (data[0] != 0) {
+    state_.toggle_values |= bit;
+  } else {
+    state_.toggle_values &= static_cast<uint16_t>(~bit);
+  }
+  state_.toggle_valid_mask |= bit;
   publish_state_();
+}
+
+void DSPiHub::mark_toggle_unsupported_(ToggleTarget target, uint8_t status) {
+  // A link failure is not an answer about the parameter -- the device never
+  // replied at all, so this arrived via fail_current_() rather than from a
+  // rejection.  Latching on it would let one flaky moment stop a toggle being
+  // read for good, and only a reprobe would undo it.
+  if (status == CTRL_STATUS_LINK_FAILED)
+    return;
+
+  const uint16_t bit = toggle_bit(target);
+  if ((toggle_unsupported_ & bit) != 0)
+    return;
+  toggle_unsupported_ |= bit;
+  // Warn once and then go quiet.  A permanent rejection here means the firmware
+  // has no such parameter, so retrying it on every refresh would fill the log
+  // for the lifetime of the device without ever succeeding.
+  ESP_LOGW(TAG, "Device rejected %s (0x%02X): %s; not reading it again", toggle_name(target),
+           toggle_get_opcode(target), ctrl_status_to_string(status));
+}
+
+void DSPiHub::on_user_mute_(const uint8_t *data, uint16_t len) { store_toggle_(ToggleTarget::USER_MUTE, data, len); }
+void DSPiHub::on_loudness_(const uint8_t *data, uint16_t len) { store_toggle_(ToggleTarget::LOUDNESS, data, len); }
+void DSPiHub::on_eq_bypass_(const uint8_t *data, uint16_t len) { store_toggle_(ToggleTarget::EQ_BYPASS, data, len); }
+void DSPiHub::on_crossfeed_(const uint8_t *data, uint16_t len) { store_toggle_(ToggleTarget::CROSSFEED, data, len); }
+void DSPiHub::on_leveller_(const uint8_t *data, uint16_t len) {
+  store_toggle_(ToggleTarget::LEVELLER, data, len);
+}
+
+void DSPiHub::on_user_mute_failed_(uint8_t status) { mark_toggle_unsupported_(ToggleTarget::USER_MUTE, status); }
+void DSPiHub::on_loudness_failed_(uint8_t status) { mark_toggle_unsupported_(ToggleTarget::LOUDNESS, status); }
+void DSPiHub::on_eq_bypass_failed_(uint8_t status) { mark_toggle_unsupported_(ToggleTarget::EQ_BYPASS, status); }
+void DSPiHub::on_crossfeed_failed_(uint8_t status) { mark_toggle_unsupported_(ToggleTarget::CROSSFEED, status); }
+void DSPiHub::on_leveller_failed_(uint8_t status) {
+  mark_toggle_unsupported_(ToggleTarget::LEVELLER, status);
+}
+
+void DSPiHub::enqueue_toggle_read_(ToggleTarget target) {
+  void (DSPiHub::*ok)(const uint8_t *, uint16_t) = nullptr;
+  void (DSPiHub::*fail)(uint8_t) = nullptr;
+  switch (target) {
+    case ToggleTarget::USER_MUTE:
+      ok = &DSPiHub::on_user_mute_;
+      fail = &DSPiHub::on_user_mute_failed_;
+      break;
+    case ToggleTarget::LOUDNESS:
+      ok = &DSPiHub::on_loudness_;
+      fail = &DSPiHub::on_loudness_failed_;
+      break;
+    case ToggleTarget::EQ_BYPASS:
+      ok = &DSPiHub::on_eq_bypass_;
+      fail = &DSPiHub::on_eq_bypass_failed_;
+      break;
+    case ToggleTarget::CROSSFEED:
+      ok = &DSPiHub::on_crossfeed_;
+      fail = &DSPiHub::on_crossfeed_failed_;
+      break;
+    case ToggleTarget::LEVELLER:
+      ok = &DSPiHub::on_leveller_;
+      fail = &DSPiHub::on_leveller_failed_;
+      break;
+  }
+  enqueue_get_(toggle_get_opcode(target), 1, ok, /*priority=*/1, /*wvalue=*/0, fail);
 }
 
 void DSPiHub::on_input_source_(const uint8_t *data, uint16_t len) {
@@ -905,16 +1027,29 @@ void DSPiHub::set_user_volume_db(float db) {
   request_refresh();
 }
 
-void DSPiHub::set_user_mute(bool mute) {
+void DSPiHub::set_toggle(ToggleTarget target, bool on) {
   Transaction t;
-  t.req = REQ_SET_USER_MUTE;
+  // An ordinary SET, unlike the preset load: these opcodes sit on the firmware's
+  // SET path.  wvalue stays 0, as every other setter here leaves it -- each
+  // toggle has its own opcode, so enqueue_()'s (req, frame_type, wvalue)
+  // identity already keeps two different toggles apart, and folds a toggle
+  // flipped twice in quick succession down to the newest value, which is what
+  // we want.  Packing the target into wvalue would work (the firmware ignores
+  // it) but would put a meaningless value on the wire.
+  t.req = toggle_set_opcode(target);
   t.frame_type = FRAME_SET_REQ;
   t.wlen = 1;
   t.payload_len = 1;
-  t.payload[0] = mute ? 1 : 0;
+  t.payload[0] = on ? 1 : 0;
   t.priority = 0;
+  // None of these writes flash or resets the pipeline, so an ordinary timeout.
   t.timeout_ms = request_timeout_ms_;
   enqueue_(t);
+
+  // Start reading it back even if no entity asked for it.  Without this a
+  // lambda-only caller would write the value and never observe it, leaving
+  // toggle_valid() false for the lifetime of the device.
+  toggle_read_mask_ |= toggle_bit(target);
   request_refresh();
 }
 

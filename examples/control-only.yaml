@@ -88,8 +88,30 @@ number:
 switch:
   - platform: dspi
     dspi_id: dspi_hub
+    type: user_mute
     name: Mute
     id: dspi_mute
+
+  # The DSP feature toggles. Each is one byte on the wire and costs nothing to
+  # leave out, so configure only the ones you want -- an omitted toggle is not
+  # even polled. All of them are per-preset and live in RAM: switching a preset
+  # rewrites them, and nothing here persists them across a DSPi reboot.
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: loudness
+    name: Loudness
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: eq_bypass
+    name: EQ Bypass
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: crossfeed
+    name: Crossfeed
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: leveller
+    name: Leveller
 
 select:
   - platform: dspi

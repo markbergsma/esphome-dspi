@@ -81,11 +81,37 @@ number:
     name: Master Volume
     id: dspi_master_volume
 
+# Every switch type, since this is the only config CI runs codegen on. The
+# icon override on one of them checks that the per-type default does not
+# clobber a user's choice.
 switch:
   - platform: dspi
     dspi_id: dspi_hub
+    type: user_mute
     name: Mute
     id: dspi_mute
+
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: loudness
+    name: Loudness
+    id: dspi_loudness
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: eq_bypass
+    name: EQ Bypass
+    id: dspi_bypass
+    icon: mdi:eq
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: crossfeed
+    name: Crossfeed
+    id: dspi_crossfeed
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: leveller
+    name: Leveller
+    id: dspi_leveller
 
 select:
   - platform: dspi

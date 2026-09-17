@@ -20,6 +20,11 @@ namespace dspi {
 // Every field is authoritative only once its `*_valid` flag is set: before the
 // first successful read we genuinely do not know the device's state, and
 // publishing a default would be a lie that entities would then echo back.
+//
+// The boolean DSP parameters are the same rule expressed for a family rather
+// than a field: `toggle_valid_mask` is a bitmask of the *_valid flags and
+// `toggle_values` holds the values themselves. Reach both only through
+// toggle() / toggle_valid(), never by masking directly.
 struct DSPiState {
   // The output ceiling: a configuration setting, not a listening control.
   float master_volume_db{0.0f};
@@ -27,8 +32,11 @@ struct DSPiState {
   // The listening control, and the same field the USB host's slider drives.
   float user_volume_db{0.0f};
   bool user_volume_valid{false};
-  bool user_mute{false};
-  bool user_mute_valid{false};
+  // The boolean DSP parameters, indexed by ToggleTarget. Mute lives here too:
+  // it is the same 1-byte SET/GET shape as the rest, so giving it its own
+  // named pair would only mean carrying two styles in one struct.
+  uint16_t toggle_values{0};
+  uint16_t toggle_valid_mask{0};
   uint8_t input_source{INPUT_SOURCE_USB};
   bool input_source_valid{false};
   // Bit N set means source N can actually be selected on this device. ADAT and
@@ -50,6 +58,9 @@ struct DSPiState {
   // reporting, since a slot being empty does not stop it being loaded.
   uint16_t slot_occupied{0};
   bool preset_dir_valid{false};
+
+  bool toggle(ToggleTarget t) const { return (toggle_values & toggle_bit(t)) != 0; }
+  bool toggle_valid(ToggleTarget t) const { return (toggle_valid_mask & toggle_bit(t)) != 0; }
 };
 
 // Implemented by the child entity platforms.  An abstract listener rather than
@@ -193,8 +204,22 @@ class DSPiHub : public Component, public uart::UARTDevice {
   // Control surface, usable from a lambda with no entity configured.
   void set_master_volume_db(float db);
   void set_user_volume_db(float db);
-  void set_user_mute(bool mute);
   void set_input_source(uint8_t source);
+  // Set one of the boolean DSP parameters. Also starts reading it back, so this
+  // works on a device that configures no switch for it at all -- otherwise the
+  // value would be written and then never observed, leaving toggle_valid()
+  // false forever.
+  void set_toggle(ToggleTarget target, bool on);
+  // Named wrappers, so a lambda reads as prose rather than as an enum lookup.
+  void set_user_mute(bool mute) { set_toggle(ToggleTarget::USER_MUTE, mute); }
+  void set_loudness(bool on) { set_toggle(ToggleTarget::LOUDNESS, on); }
+  void set_eq_bypass(bool on) { set_toggle(ToggleTarget::EQ_BYPASS, on); }
+  void set_crossfeed(bool on) { set_toggle(ToggleTarget::CROSSFEED, on); }
+  void set_leveller(bool on) { set_toggle(ToggleTarget::LEVELLER, on); }
+  // Include `target` in the refresh burst. Called from codegen for every
+  // configured switch, so a device pays no UART traffic for a parameter it
+  // does not expose.
+  void enable_toggle_read(ToggleTarget target) { toggle_read_mask_ |= toggle_bit(target); }
   // Load a preset slot (0..9).  The device defers the work, so this returns
   // long before the preset is live and nothing is published until a readback
   // confirms the device actually moved.
@@ -239,13 +264,21 @@ class DSPiHub : public Component, public uart::UARTDevice {
   };
 
   // --- queue ---------------------------------------------------------------
-  static constexpr uint8_t QUEUE_DEPTH = 8;
+  //
+  // Sized from the largest burst plus what can legitimately be in flight
+  // alongside it: a refresh is up to 4 fixed reads + TOGGLE_COUNT toggle reads
+  // = 9, an RTA band poll owns at most one slot, a user-initiated SET one more,
+  // and one spare. Recount this if the refresh burst grows -- and note that
+  // loop() deliberately waits for room for the whole burst rather than letting
+  // enqueue_() evict a sibling read.
+  static constexpr uint8_t QUEUE_DEPTH = 12;
   std::array<Transaction, QUEUE_DEPTH> queue_{};
 
   bool enqueue_(const Transaction &txn);
   int find_next_() const;
+  uint8_t queue_free_() const;
   void enqueue_get_(uint8_t req, uint16_t wlen, void (DSPiHub::*cb)(const uint8_t *, uint16_t), uint8_t priority = 1,
-                    uint16_t wvalue = 0);
+                    uint16_t wvalue = 0, void (DSPiHub::*on_fail)(uint8_t) = nullptr);
 
   // --- transport -----------------------------------------------------------
   void pump_rx_();
@@ -271,9 +304,31 @@ class DSPiHub : public Component, public uart::UARTDevice {
   // --- readback handlers ---------------------------------------------------
   void on_master_volume_(const uint8_t *data, uint16_t len);
   void on_user_volume_(const uint8_t *data, uint16_t len);
-  void on_user_mute_(const uint8_t *data, uint16_t len);
   void on_input_source_(const uint8_t *data, uint16_t len);
   void publish_state_();
+
+  // --- boolean DSP parameters ----------------------------------------------
+  //
+  // Transaction::on_ok carries no request identity, so each target needs its
+  // own trampoline into the shared store. Recovering the target from
+  // current_.req instead would work but would lean on an undocumented lifetime
+  // coupling to save five one-line functions.
+  void store_toggle_(ToggleTarget target, const uint8_t *data, uint16_t len);
+  void mark_toggle_unsupported_(ToggleTarget target, uint8_t status);
+  void on_user_mute_(const uint8_t *data, uint16_t len);
+  void on_loudness_(const uint8_t *data, uint16_t len);
+  void on_eq_bypass_(const uint8_t *data, uint16_t len);
+  void on_crossfeed_(const uint8_t *data, uint16_t len);
+  void on_leveller_(const uint8_t *data, uint16_t len);
+  void on_user_mute_failed_(uint8_t status);
+  void on_loudness_failed_(uint8_t status);
+  void on_eq_bypass_failed_(uint8_t status);
+  void on_crossfeed_failed_(uint8_t status);
+  void on_leveller_failed_(uint8_t status);
+  void enqueue_toggle_read_(ToggleTarget target);
+  // Toggles worth reading: what the YAML configured, less anything the device
+  // has permanently rejected.
+  uint16_t toggles_to_read_() const { return toggle_read_mask_ & ~toggle_unsupported_; }
 
   // --- presets -------------------------------------------------------------
   void on_preset_dir_(const uint8_t *data, uint16_t len);
@@ -317,6 +372,14 @@ class DSPiHub : public Component, public uart::UARTDevice {
   uint32_t refresh_due_at_{0};
   bool refresh_pending_{false};
   uint8_t consecutive_failures_{0};
+
+  // Mute is read unconditionally, because set_user_mute() is documented as
+  // usable from a lambda on a device that configures no switch at all.
+  uint16_t toggle_read_mask_{toggle_bit(ToggleTarget::USER_MUTE)};
+  // Targets whose GET drew a permanent rejection -- older firmware, or a build
+  // without that feature. Latched so the read stops being issued instead of
+  // logging an error on every refresh forever. Cleared on re-identify.
+  uint16_t toggle_unsupported_{0};
 
   // Notification bookkeeping.  A gap in seq means the device dropped events
   // for us, which is the only signal available that we have missed something.
