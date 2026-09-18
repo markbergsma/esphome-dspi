@@ -22,11 +22,28 @@ enum class SensorTarget : uint8_t {
 // while I2S is selected, the USB host's choice the moment USB is. A config
 // that clocks I2S at 44.1 kHz is therefore not evidence the device is running
 // at 44.1 kHz; this entity is.
-class DSPiSensor : public sensor::Sensor, public Component, public DSPiStateListener {
+// Polled rather than driven by notifications. The firmware raises nothing when
+// only the sample rate changes -- a USB host moving between 44.1 and 48 kHz is
+// silent on the wire -- so an entity that only refreshed on events would sit
+// on a stale number indefinitely. A rate that is confidently wrong is worse
+// than one that is briefly absent, so this asks. Identical queued reads
+// coalesce in the hub, so a short interval costs one 8-byte exchange per tick
+// and cannot back up.
+class DSPiSensor : public sensor::Sensor, public PollingComponent, public DSPiStateListener {
  public:
   void set_parent(DSPiHub *parent) { parent_ = parent; }
   void set_target(SensorTarget target) { target_ = target; }
   void dump_config() override;
+
+  void update() override {
+    if (parent_ == nullptr)
+      return;
+    switch (target_) {
+      case SensorTarget::PIPELINE_RATE:
+        parent_->request_input_rate();
+        break;
+    }
+  }
 
   void on_dspi_state(const DSPiState &state) override {
     if (target_ != SensorTarget::PIPELINE_RATE)

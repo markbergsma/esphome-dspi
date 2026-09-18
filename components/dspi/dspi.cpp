@@ -1095,6 +1095,15 @@ void DSPiHub::request_refresh() {
   refresh_pending_ = true;
 }
 
+void DSPiHub::request_input_rate() {
+  // Skipped while the device has not answered the probe: the queue is for
+  // work that can actually be sent, and a poller firing every few seconds
+  // would otherwise churn it for the whole time a DSPi is absent.
+  if (!is_online())
+    return;
+  enqueue_get_(REQ_GET_INPUT_RATE, INPUT_RATE_LEN, &DSPiHub::on_input_rate_);
+}
+
 // ---------------------------------------------------------------------------
 // Spectrum analyser (RTA)
 // ---------------------------------------------------------------------------

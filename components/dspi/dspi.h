@@ -234,6 +234,13 @@ class DSPiHub : public Component, public uart::UARTDevice {
   // Re-read everything we publish.  Debounced, so a burst of notifications
   // costs one round of reads rather than one per event.
   void request_refresh();
+  // Re-read just the pipeline rate.  Separate from request_refresh() because
+  // the firmware raises no notification when only the rate changes -- a USB
+  // host moving between 44.1 and 48 kHz says nothing -- so an entity showing
+  // it has to poll, and polling the whole parameter set to get one value would
+  // be wasteful. Identical queued reads coalesce, so calling this on a short
+  // interval cannot build a backlog.
+  void request_input_rate();
 
   const DSPiState &state() const { return state_; }
   // False only when the probe has run and the device said this source is not

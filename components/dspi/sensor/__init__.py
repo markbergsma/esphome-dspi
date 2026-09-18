@@ -13,7 +13,7 @@ from .. import DSPI_COMPONENT_SCHEMA, dspi_ns, register_dspi_child
 
 DEPENDENCIES = ["dspi"]
 
-DSPiSensor = dspi_ns.class_("DSPiSensor", sensor.Sensor, cg.Component)
+DSPiSensor = dspi_ns.class_("DSPiSensor", sensor.Sensor, cg.PollingComponent)
 SensorTarget = dspi_ns.enum("SensorTarget", is_class=True)
 
 # `pipeline_rate` is the rate the DSP and every output are actually running at,
@@ -41,7 +41,11 @@ CONFIG_SCHEMA = (
         }
     )
     .extend(DSPI_COMPONENT_SCHEMA)
-    .extend(cv.COMPONENT_SCHEMA)
+    # Polled, not notified. Nothing is raised when only the rate changes, so
+    # the alternative to asking is showing a stale number as though it were
+    # current. 5s is cheap -- one 8-byte read, and identical queued reads
+    # coalesce -- and bounds how long a wrong reading can survive.
+    .extend(cv.polling_component_schema("5s"))
 )
 
 
