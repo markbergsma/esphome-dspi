@@ -189,6 +189,7 @@ enum Opcode : uint8_t {
   REQ_GET_USER_MUTE = 0xDD,           // GET  -> uint8 0/1
   REQ_SET_INPUT_SOURCE = 0xE0,        // SET  <- uint8 InputSource
   REQ_GET_INPUT_SOURCE = 0xE1,        // GET  -> uint8 InputSource (active, not pending)
+  REQ_GET_INPUT_RATE = 0xEE,          // GET  -> 2x uint32 {audio_state.freq, i2s_input_rate}
   REQ_GET_SPDIF_INPUT_CONFIG = 0xEF,  // GET  -> count, enable mask, one GPIO per input
   REQ_GET_UART_CONFIG = 0xF6,         // GET  -> 8-byte UartCtrlConfig
   REQ_GET_CTRL_IFACE_STATUS = 0xF9,   // GET  -> 8-byte CtrlIfaceStatus
@@ -452,6 +453,39 @@ inline bool parse_preset_directory(const uint8_t *data, uint16_t len, PresetDire
   out->last_active_slot = data[4];
   out->output_config_mode = data[5];
   out->master_volume_mode = data[6];
+  return true;
+}
+
+// What REQ_GET_INPUT_RATE reports: the rate the DSP pipeline is actually
+// running at, and the rate selected for the I2S input.
+//
+// The DSPi has no sample rate conversion -- perform_rate_change() restarts
+// every output on one divider -- so `freq` is simultaneously the rate of the
+// active input, of the DSP, and of every output. It follows whatever source is
+// active, which is why it is not necessarily the rate an I2S master is
+// clocking at: switch the DSPi to USB and it becomes the host's rate.
+//
+// `i2s_input_rate` is the *selected* I2S rate, a stored setting rather than a
+// measurement. In clock-slave mode the real rate is auto-detected and this
+// field says nothing useful, which is why nothing here publishes it.
+struct InputRate {
+  uint32_t freq{0};            // audio_state.freq -- the live pipeline rate
+  uint32_t i2s_input_rate{0};  // the selected I2S input rate, not a measurement
+};
+
+static constexpr uint16_t INPUT_RATE_LEN = 8;
+
+inline bool parse_input_rate(const uint8_t *data, uint16_t len, InputRate *out) {
+  if (len < INPUT_RATE_LEN)
+    return false;
+  // Assembled here rather than through rta_rd_u32, which is a plain
+  // little-endian reader but is declared further down this header.
+  auto rd_u32 = [](const uint8_t *d) {
+    return static_cast<uint32_t>(d[0]) | (static_cast<uint32_t>(d[1]) << 8) |
+           (static_cast<uint32_t>(d[2]) << 16) | (static_cast<uint32_t>(d[3]) << 24);
+  };
+  out->freq = rd_u32(data);
+  out->i2s_input_rate = rd_u32(data + 4);
   return true;
 }
 
@@ -758,9 +792,16 @@ enum NotifyEvent : uint8_t {
 // IDs deliberately return false: the enum is actively growing in the firmware
 // (0x07..0x0C are already assigned), and treating an unrecognised event as an
 // error, or as a reason to re-read, would be wrong in both directions.
+//
+// INPUT_FORMAT is named for the channel count but the firmware raises it on a
+// USB alt change and on an input-source switch as well, both of which can move
+// the pipeline rate this component publishes. It is a hint like the rest: we
+// re-read rather than decode it. It will not catch a host changing only the
+// sample rate via SET_CUR, which raises no notification at all -- a reading
+// can therefore lag until the next event.
 inline bool notify_event_affects_params(uint8_t event_id) {
   return event_id == NOTIFY_EVT_PARAM_CHANGED || event_id == NOTIFY_EVT_BULK_INVALIDATED ||
-         event_id == NOTIFY_EVT_PRESET_LOADED;
+         event_id == NOTIFY_EVT_PRESET_LOADED || event_id == NOTIFY_EVT_INPUT_FORMAT;
 }
 
 }  // namespace dspi

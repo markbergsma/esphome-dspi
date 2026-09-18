@@ -72,11 +72,14 @@ void DSPiHub::loop() {
   // transaction ends in a response, a permanent rejection or a timeout.
   if (refresh_pending_ && (now - refresh_due_at_) < 0x80000000UL) {
     const uint16_t toggles = toggles_to_read_();
-    if (queue_free_() >= 4 + toggle_mask_count(toggles)) {
+    if (queue_free_() >= 5 + toggle_mask_count(toggles)) {
       refresh_pending_ = false;
       enqueue_get_(REQ_GET_MASTER_VOLUME, 4, &DSPiHub::on_master_volume_);
       enqueue_get_(REQ_GET_USER_VOLUME, 4, &DSPiHub::on_user_volume_);
       enqueue_get_(REQ_GET_INPUT_SOURCE, 1, &DSPiHub::on_input_source_);
+      // The pipeline rate follows the active source, and INPUT_FORMAT brings us
+      // back through here whenever that source or its format changes.
+      enqueue_get_(REQ_GET_INPUT_RATE, INPUT_RATE_LEN, &DSPiHub::on_input_rate_);
       // One byte, and the only way a preset loaded elsewhere -- DSPi Console, a
       // control surface -- becomes visible here.  The 32-byte name read it may
       // trigger is conditional on the slot having actually changed.
@@ -820,6 +823,18 @@ void DSPiHub::on_input_source_(const uint8_t *data, uint16_t len) {
       set_input_source(boot_input_source_);
     }
   }
+}
+
+void DSPiHub::on_input_rate_(const uint8_t *data, uint16_t len) {
+  InputRate rate;
+  if (!parse_input_rate(data, len, &rate))
+    return;
+  // Only the live pipeline rate is published. The companion field is the
+  // *selected* I2S input rate, which says nothing in clock-slave mode where
+  // the device detects the rate for itself.
+  state_.pipeline_rate_hz = rate.freq;
+  state_.pipeline_rate_valid = true;
+  publish_state_();
 }
 
 void DSPiHub::publish_state_() {

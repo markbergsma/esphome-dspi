@@ -141,3 +141,13 @@ text_sensor:
     type: preset_name
     name: Preset Name
     id: dspi_preset_name
+
+sensor:
+  # The rate the DSP and every output are actually running at. Not derivable
+  # from any controller-side config: the DSPi does no sample rate conversion,
+  # so this follows whichever source is active.
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: pipeline_rate
+    name: Sample Rate
+    id: dspi_pipeline_rate

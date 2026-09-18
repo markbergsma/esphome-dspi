@@ -58,6 +58,13 @@ struct DSPiState {
   // reporting, since a slot being empty does not stop it being loaded.
   uint16_t slot_occupied{0};
   bool preset_dir_valid{false};
+  // The rate the DSP pipeline and every output run at, read from
+  // REQ_GET_INPUT_RATE. The DSPi does no sample rate conversion, so this is
+  // the active input's rate too, and it follows the source rather than
+  // whatever an I2S master happens to be clocking: selecting USB makes it the
+  // host's rate. Zero until the first readback.
+  uint32_t pipeline_rate_hz{0};
+  bool pipeline_rate_valid{false};
 
   bool toggle(ToggleTarget t) const { return (toggle_values & toggle_bit(t)) != 0; }
   bool toggle_valid(ToggleTarget t) const { return (toggle_valid_mask & toggle_bit(t)) != 0; }
@@ -305,6 +312,7 @@ class DSPiHub : public Component, public uart::UARTDevice {
   void on_master_volume_(const uint8_t *data, uint16_t len);
   void on_user_volume_(const uint8_t *data, uint16_t len);
   void on_input_source_(const uint8_t *data, uint16_t len);
+  void on_input_rate_(const uint8_t *data, uint16_t len);
   void publish_state_();
 
   // --- boolean DSP parameters ----------------------------------------------
