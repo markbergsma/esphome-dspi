@@ -20,6 +20,7 @@ Currently only basic functionality is supported:
 - Input source select
 - Preset select
 - DSP toggles: loudness, EQ bypass, crossfeed, leveller
+- Active preset name, and the sample rate the DSPi is actually running at
 - Spectrum analyser (RTA) band data, for driving a display — see [docs/spectrum-analyzer.md](docs/spectrum-analyzer.md)
 
 ## Quick start
@@ -309,6 +310,31 @@ text_sensor:
     type: preset_name
     name: Preset Name
 ```
+
+### `sensor`
+
+| `type` | Publishes |
+|---|---|
+| `pipeline_rate` | The sample rate the DSP and every output are running at, in Hz. |
+
+```yaml
+sensor:
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: pipeline_rate
+    name: Sample Rate
+```
+
+The DSPi does no sample rate conversion, so one rate covers the active input,
+the DSP and the outputs at once, and it follows whichever source is selected.
+That makes it the one audio parameter a controller cannot infer from its own
+config: clocking I2S at 44.1 kHz is no evidence the device is running at
+44.1 kHz, because switching it to USB hands the choice to the host.
+
+Polled, at `update_interval` (default 5s), because the device raises no
+notification when only the rate changes. An input-source switch does notify
+and is picked up immediately; the interval bounds how long a rate change made
+any other way can go unnoticed.
 
 
 ## Using it without any entities

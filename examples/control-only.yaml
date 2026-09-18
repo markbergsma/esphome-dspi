@@ -145,3 +145,15 @@ text_sensor:
     type: preset_name
     name: Preset Name
     id: dspi_preset_name
+
+sensor:
+  # The rate the DSP and every output are running at. The DSPi does no sample
+  # rate conversion, so this one rate covers the active input, the DSP and the
+  # outputs together, and it follows whichever source is selected -- select USB
+  # and it becomes whatever the host asked for. Polled, because the device
+  # raises no notification when only the rate changes.
+  - platform: dspi
+    dspi_id: dspi_hub
+    type: pipeline_rate
+    name: Sample Rate
+    id: dspi_pipeline_rate
